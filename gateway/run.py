@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -7675,6 +7676,20 @@ class GatewayRunner:
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
 
+        if not is_internal and not event.get_command():
+            if event.media_urls:
+                workout_notice = await self._maybe_auto_stage_telegram_workout_screenshots(
+                    event,
+                    _quick_key,
+                )
+                if workout_notice:
+                    return workout_notice
+            else:
+                self._remember_telegram_workout_screenshot_hint(
+                    _quick_key,
+                    event.text or "",
+                )
+
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
         # are handled with minimal latency.
@@ -8215,6 +8230,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "batch":
+            return await self._handle_workout_batch_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -10509,6 +10527,335 @@ class GatewayRunner:
         ])
 
         return "\n".join(lines)
+
+    async def _handle_workout_batch_command(self, event: MessageEvent) -> str:
+        """Handle /batch workout screenshot review commands."""
+        args_text = event.get_command_args().strip()
+        try:
+            args = shlex.split(args_text) if args_text else ["status"]
+        except ValueError as exc:
+            return f"Invalid /batch arguments: {exc}"
+
+        script_path = Path(
+            os.environ.get(
+                "HERMES_WORKOUT_BATCH_COMMAND_SCRIPT",
+                r"C:\Users\zac_r\Desktop\Hermes_Windows\scripts\workout_screenshot_commands.py",
+            )
+        )
+        if not script_path.exists():
+            return f"Workout batch command script not found: {script_path}"
+
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+            env = _sanitize_subprocess_env(os.environ.copy())
+        except Exception:
+            env = {}
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(script_path),
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+        except asyncio.TimeoutError:
+            return "Workout batch command timed out."
+        except Exception as exc:
+            return f"Workout batch command failed: {exc}"
+
+        output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
+        if output:
+            try:
+                from agent.redact import redact_sensitive_text
+                output = redact_sensitive_text(output)
+            except Exception:
+                output = _redact_gateway_user_facing_secrets(output)
+        if proc.returncode != 0:
+            return output or f"Workout batch command failed with exit code {proc.returncode}."
+        if len(output) > 3500:
+            output = output[:3500] + "\n...truncated..."
+        return output or "Workout batch command returned no output."
+
+    def _workout_screenshot_script(self, name: str) -> Path:
+        script_dir = Path(
+            os.environ.get(
+                "HERMES_WORKOUT_SCREENSHOT_SCRIPT_DIR",
+                r"C:\Users\zac_r\Desktop\Hermes_Windows\scripts",
+            )
+        )
+        return script_dir / name
+
+    def _telegram_workout_screenshot_hint_store(self) -> Dict[str, Dict[str, Any]]:
+        store = getattr(self, "_telegram_workout_screenshot_hints", None)
+        if store is None:
+            store = {}
+            self._telegram_workout_screenshot_hints = store
+        return store
+
+    def _looks_like_workout_screenshot_context(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+        if not normalized:
+            return False
+        workout_terms = (
+            "workout",
+            "workouts",
+            "training",
+            "gym",
+            "lift",
+            "lifting",
+            "cardio",
+            "hyrox",
+            "wod",
+        )
+        screenshot_terms = (
+            "screenshot",
+            "screenshots",
+            "photo",
+            "photos",
+            "image",
+            "images",
+            "pic",
+            "pics",
+            "attached",
+            "send",
+            "sending",
+            "upload",
+            "ingest",
+            "ingestion",
+            "before",
+            "after",
+            "pre",
+            "post",
+            "next",
+            "tomorrow",
+            "saturday",
+            "sunday",
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "weekly",
+            "week",
+            "plan",
+            "planned",
+            "completed",
+            "result",
+            "results",
+        )
+        if "next 2 workouts" in normalized or "next two workouts" in normalized:
+            return True
+        return any(term in normalized for term in workout_terms) and any(
+            term in normalized for term in screenshot_terms
+        )
+
+    def _remember_telegram_workout_screenshot_hint(self, session_key: str, text: str) -> None:
+        if not self._looks_like_workout_screenshot_context(text):
+            return
+        store = self._telegram_workout_screenshot_hint_store()
+        store[session_key] = {
+            "text": re.sub(r"\s+", " ", text).strip()[:500],
+            "ts": time.time(),
+        }
+        logger.info("Remembered Telegram workout screenshot hint for %s", session_key)
+
+    def _recent_telegram_workout_screenshot_hint(self, session_key: str) -> Optional[str]:
+        store = self._telegram_workout_screenshot_hint_store()
+        hint = store.get(session_key)
+        if not hint:
+            return None
+        ttl_seconds = float(os.environ.get("HERMES_WORKOUT_SCREENSHOT_HINT_TTL", "900"))
+        if time.time() - float(hint.get("ts") or 0) > ttl_seconds:
+            store.pop(session_key, None)
+            return None
+        return str(hint.get("text") or "").strip() or None
+
+    def _classify_workout_screenshot_batch(self, text: str, file_count: int) -> tuple[str, str]:
+        normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+        pre_terms = ("next", "tomorrow", "plan", "planned", "before", "pre", "upcoming")
+        post_terms = ("after", "post", "completed", "done", "result", "results", "finished")
+        if any(term in normalized for term in post_terms):
+            return "post-workout-result", "post"
+        if any(term in normalized for term in pre_terms):
+            return "pre-workout-plan", "pre"
+        if "week" in normalized or "weekly" in normalized or file_count >= 3:
+            return "weekly-ingestion", "mixed"
+        return "results-context", "unknown"
+
+    def _workout_screenshot_message_ids(self, event: MessageEvent) -> list[str]:
+        ids: list[str] = []
+        for value in (
+            getattr(event, "message_id", None),
+            getattr(getattr(event, "source", None), "message_id", None),
+            getattr(getattr(event, "raw_message", None), "message_id", None),
+            getattr(getattr(event, "raw_message", None), "id", None),
+        ):
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text not in ids:
+                ids.append(text)
+        return ids
+
+    async def _run_workout_screenshot_script(
+        self,
+        script_path: Path,
+        args: list[str],
+        *,
+        timeout: float,
+    ) -> tuple[int, str, str]:
+        try:
+            from tools.environments.local import _sanitize_subprocess_env
+            env = _sanitize_subprocess_env(os.environ.copy())
+        except Exception:
+            env = {}
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script_path),
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return (
+            proc.returncode,
+            (stdout or b"").decode("utf-8", errors="replace").strip(),
+            (stderr or b"").decode("utf-8", errors="replace").strip(),
+        )
+
+    async def _maybe_auto_stage_telegram_workout_screenshots(
+        self,
+        event: MessageEvent,
+        session_key: str,
+    ) -> Optional[str]:
+        source = event.source
+        if not source or source.platform != Platform.TELEGRAM:
+            return None
+
+        image_paths: list[str] = []
+        for index, path in enumerate(event.media_urls or []):
+            media_type = event.media_types[index] if index < len(event.media_types) else ""
+            if media_type.startswith("image/") or event.message_type == MessageType.PHOTO:
+                image_paths.append(str(path))
+        if not image_paths:
+            return None
+
+        current_text = re.sub(r"\s+", " ", event.text or "").strip()
+        recent_hint = self._recent_telegram_workout_screenshot_hint(session_key)
+        intent_text = current_text if self._looks_like_workout_screenshot_context(current_text) else recent_hint
+        if not intent_text:
+            return None
+
+        intake_script = self._workout_screenshot_script("workout_screenshot_intake.py")
+        privacy_script = self._workout_screenshot_script("workout_screenshot_privacy.py")
+        if not intake_script.exists():
+            logger.warning("Workout screenshot intake script not found: %s", intake_script)
+            return f"I received {len(image_paths)} workout image(s), but the intake script was not found: {intake_script}"
+
+        mode, timing_hint = self._classify_workout_screenshot_batch(intent_text, len(image_paths))
+        batch_id = f"telegram-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        note = intent_text[:500]
+        args = [
+            "--batch-id",
+            batch_id,
+            "--source",
+            "telegram",
+            "--mode",
+            mode,
+            "--timing-hint",
+            timing_hint,
+            "--source-chat-id",
+            str(source.chat_id),
+            "--note",
+            note,
+            "--json",
+        ]
+        for message_id in self._workout_screenshot_message_ids(event):
+            args.extend(["--source-message-id", message_id])
+        args.extend(image_paths)
+
+        try:
+            returncode, stdout, stderr = await self._run_workout_screenshot_script(
+                intake_script,
+                args,
+                timeout=30,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Workout screenshot auto-stage timed out for %s", session_key)
+            return "I received the workout screenshot(s), but staging timed out. Try `/batch status` in a moment."
+        except Exception as exc:
+            logger.warning("Workout screenshot auto-stage failed: %s", exc, exc_info=True)
+            return f"I received the workout screenshot(s), but staging failed: {exc}"
+
+        if returncode != 0:
+            detail = (stderr or stdout or f"exit code {returncode}")[:800]
+            try:
+                from agent.redact import redact_sensitive_text
+                detail = redact_sensitive_text(detail)
+            except Exception:
+                detail = _redact_gateway_user_facing_secrets(detail)
+            return f"I received the workout screenshot(s), but staging failed: {detail}"
+
+        try:
+            manifest = json.loads(stdout)
+        except json.JSONDecodeError:
+            manifest = {"batch_id": batch_id, "file_count": len(image_paths)}
+
+        manifest_batch_id = manifest.get("batch_id") or batch_id
+        file_count = manifest.get("file_count") or len(image_paths)
+        privacy_status = "privacy pending"
+        if privacy_script.exists():
+            try:
+                privacy_code, privacy_stdout, privacy_stderr = await self._run_workout_screenshot_script(
+                    privacy_script,
+                    ["--batch-id", manifest_batch_id, "--apply-acl", "--redact", "--json"],
+                    timeout=60,
+                )
+                if privacy_code == 0:
+                    try:
+                        privacy_report = json.loads(privacy_stdout)
+                        statuses = {
+                            str(item.get("status") or "")
+                            for item in privacy_report.get("redaction_results", [])
+                        }
+                    except Exception:
+                        statuses = set()
+                    if statuses and statuses <= {"redacted_derivative_created"}:
+                        privacy_status = "ACL applied; redacted derivatives created"
+                    elif statuses:
+                        privacy_status = "ACL applied; privacy derivative attempted, metadata stripping not fully proven"
+                    else:
+                        privacy_status = "ACL applied; no derivative changes reported"
+                else:
+                    privacy_status = "privacy check needs attention"
+                if privacy_code != 0:
+                    logger.warning(
+                        "Workout screenshot privacy pass returned %s: %s",
+                        privacy_code,
+                        privacy_stderr or privacy_stdout,
+                    )
+            except Exception as exc:
+                privacy_status = "privacy check needs attention"
+                logger.warning("Workout screenshot privacy pass failed: %s", exc, exc_info=True)
+
+        self._telegram_workout_screenshot_hint_store().pop(session_key, None)
+        logger.info(
+            "Auto-staged Telegram workout screenshots batch=%s files=%s mode=%s",
+            manifest_batch_id,
+            file_count,
+            mode,
+        )
+        return (
+            f"Staged {file_count} workout screenshot(s) as batch `{manifest_batch_id}`.\n"
+            f"Mode: `{mode}` ({timing_hint}). {privacy_status}. Extraction is pending for the cheap online/VLM lane.\n"
+            f"Review it with `/batch review {manifest_batch_id}`."
+        )
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
@@ -17029,6 +17376,19 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Expose the current session's chat_id / message_id as env vars so
+        # agent tools (e.g. tools/set_reaction_tool.py) can act on the
+        # user's most recent message without the LLM having to track them
+        # in its own context. Single-user gateway → safe; multi-user would
+        # need a contextvars-based bridge instead.
+        try:
+            if source is not None and getattr(source, "chat_id", None) and event_message_id:
+                os.environ["HERMES_LAST_USER_CHAT_ID"] = str(source.chat_id)
+                os.environ["HERMES_LAST_USER_MESSAGE_ID"] = str(event_message_id)
+        except Exception:
+            # Never let env-var bookkeeping break a dispatch
+            logger.debug("set_reaction env-var bridge: skipped", exc_info=True)
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
