@@ -418,12 +418,32 @@ class TestReadCodexAccessToken:
 
         valid_jwt = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjk5OTk5OTk5OTl9.sig"
         with patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)), \
+             patch("hermes_cli.auth.get_codex_auth_status", return_value={
+                 "logged_in": True, "rate_limited": False
+             }), \
              patch("hermes_cli.auth._read_codex_tokens", return_value={
                  "tokens": {"access_token": valid_jwt, "refresh_token": "refresh"}
              }):
             result = _read_codex_access_token()
 
         assert result == valid_jwt
+
+    def test_pool_quota_cooldown_blocks_singleton_fallback(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)), \
+             patch("hermes_cli.auth.get_codex_auth_status", return_value={
+                 "logged_in": True,
+                 "rate_limited": True,
+                 "reset_at": time.time() + 3600,
+             }), \
+             patch("hermes_cli.auth._read_codex_tokens") as read_singleton:
+            result = _read_codex_access_token()
+
+        assert result is None
+        read_singleton.assert_not_called()
 
     def test_missing_returns_none(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"

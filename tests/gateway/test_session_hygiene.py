@@ -694,31 +694,21 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     result = await runner._handle_message(event)
 
     assert result == "ok"
-    # The compressor reported abort → exactly one warning message must
-    # have been delivered to the user.
+    # The compressor reported abort, but the original transcript was
+    # preserved. Automatic hygiene diagnostics stay in logs instead of
+    # becoming a second gateway message.
     warning_messages = [s for s in adapter.sent if "Context compression aborted" in s["content"]]
-    assert len(warning_messages) == 1, (
-        f"Expected 1 compression-aborted warning, got {len(warning_messages)}: {adapter.sent}"
-    )
-    warn = warning_messages[0]
-    # Warning must include the underlying error and tell the user nothing
-    # was dropped.
-    assert "404" in warn["content"]
-    assert "No messages were dropped" in warn["content"]
-    # Warning must land in the originating topic/thread, not the main channel.
-    assert warn["chat_id"] == "-1001"
-    assert warn["metadata"] == {"thread_id": "17585"}
+    assert warning_messages == []
 
     FakeCompressAgentWithSummaryFailure.last_instance.close.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(monkeypatch, tmp_path):
+async def test_session_hygiene_logs_when_aux_model_fails_but_recovers(monkeypatch, tmp_path):
     """When the user's configured ``auxiliary.compression.model`` errors out
     and we recover via the main model, compression succeeds but the user's
-    config is still broken.  Gateway hygiene must surface an ℹ note so the
-    user knows to fix ``auxiliary.compression.model`` — silent recovery
-    hides a misconfig only they can resolve."""
+    config is still broken. Automatic hygiene keeps this operational detail in
+    local logs instead of adding a second gateway message."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -817,21 +807,12 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     # No ⚠️ hard-failure warning (that's for dropped turns)
     hard_warnings = [s for s in adapter.sent if "Context compression summary failed" in s["content"]]
     assert len(hard_warnings) == 0, adapter.sent
-    # But an ℹ note about the configured aux model must be delivered.
+    # Automatic recovery remains diagnostic-only; no extra gateway message.
     aux_notes = [
         s for s in adapter.sent
         if "Configured compression model" in s["content"]
     ]
-    assert len(aux_notes) == 1, (
-        f"Expected 1 aux-model fallback notice, got {len(aux_notes)}: {adapter.sent}"
-    )
-    note = aux_notes[0]
-    assert "gemini-3-flash-preview" in note["content"]
-    assert "404" in note["content"]
-    assert "auxiliary.compression.model" in note["content"]
-    # Note must land in the originating topic/thread.
-    assert note["chat_id"] == "-1001"
-    assert note["metadata"] == {"thread_id": "17585"}
+    assert aux_notes == []
 
     FakeCompressAgentWithAuxRecovery.last_instance.close.assert_called_once()
 

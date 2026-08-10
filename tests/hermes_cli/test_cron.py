@@ -39,6 +39,38 @@ class TestCronCommandLifecycle:
         assert "Resumed job" in out
         assert "Triggered job" in out
 
+    def test_run_returns_nonzero_when_immediate_execution_fails(self, capsys, monkeypatch):
+        """A directly executed failed job must fail the shell command."""
+        monkeypatch.setattr(
+            cron_cli,
+            "_cron_api",
+            lambda **_: {
+                "success": True,
+                "job": {
+                    "id": "failed-job",
+                    "name": "failed-job",
+                    "executed": True,
+                    "execution_success": False,
+                },
+            },
+        )
+
+        result = cron_command(Namespace(cron_command="run", job_id="failed-job"))
+
+        assert result == 1
+        assert "Ran now: failed." in capsys.readouterr().out
+
+    def test_cmd_cron_propagates_nonzero_status_to_process(self, monkeypatch):
+        """The argparse command wrapper must not discard cron failures."""
+        from hermes_cli.main import cmd_cron
+
+        monkeypatch.setattr(cron_cli, "cron_command", lambda _: 1)
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_cron(Namespace(cron_command="run", job_id="failed-job"))
+
+        assert exc.value.code == 1
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

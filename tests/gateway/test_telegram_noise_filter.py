@@ -35,6 +35,11 @@ NOISY_STATUS_MESSAGES = [
     "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
     "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
     "⏳ Retrying in 4.2s (attempt 1/3)...",
+    "Provider unreachable — switching to fallback model...",
+    "Primary model failed — switching to fallback model...",
+    "Rate limited — switching to fallback model...",
+    "Billing or credits exhausted — switching to fallback provider...",
+    "🔄 Switched to fallback model: gpt via primary → deepseek-v4-flash via deepseek",
 ]
 
 
@@ -48,6 +53,11 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         "⏳ Retrying in 4.2s (attempt 1/3)...",
         "⏱️ Rate limited. Waiting 30.0s (attempt 2/3)...",
         "⚠️ Max retries (3) exhausted — trying fallback...",
+        "Provider unreachable — switching to fallback model...",
+        "Primary model failed — switching to fallback model...",
+        "Rate limited — switching to fallback model...",
+        "Billing or credits exhausted — switching to fallback provider...",
+        "🔄 Switched to fallback model: gpt via primary → deepseek-v4-flash via deepseek",
     ]
 
     for message in noisy_messages:

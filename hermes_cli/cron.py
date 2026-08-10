@@ -434,6 +434,8 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         if job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
+            if not job.get("execution_success"):
+                return 1
         elif job.get("execution_skipped"):
             print(f"  {job['execution_skipped']}")
         else:

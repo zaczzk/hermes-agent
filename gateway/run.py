@@ -77,12 +77,18 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|compression\s+summary\s+failed"
     r"|fallback\s+context\s+marker"
     r"|configured\s+compression\s+model\s+.+\s+failed"
+    r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|preflight\s+compression"
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
+    r"|rate\s+limited\s+[—-]\s+switching"
+    r"|provider\s+unreachable\s+[—-]\s+switching"
+    r"|primary\s+model\s+failed\s+[—-]\s+switching"
+    r"|billing(?:\s+or\s+|/)credits\s+exhausted\s+[—-]\s+switching"
+    r"|switched\s+to\s+fallback\s+model"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
@@ -12385,61 +12391,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # If summary generation failed, the
                                     # compressor aborts entirely and returns
                                     # messages unchanged — nothing is dropped.
-                                    # Surface a visible warning to the gateway
-                                    # user — agent.log alone is invisible on
-                                    # TG/Discord/etc. — so they know the chat
-                                    # is "frozen" at the current size and can
-                                    # /compress to retry or /reset to start
-                                    # fresh.
+                                    # Keep this transient provider failure in
+                                    # local diagnostics. Gateway chat users
+                                    # should receive only the completed turn (or
+                                    # one terminal, sanitised provider failure),
+                                    # never a separate compression warning.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
-                                        # Force-redact: provider exception text
-                                        # may contain credentials; this message
-                                        # reaches gateway users directly.
                                         from agent.redact import redact_sensitive_text
                                         _err = redact_sensitive_text(_err, force=True)
-                                        _warn_msg = (
-                                            "⚠️ Context compression aborted "
-                                            f"({_err}). No messages were dropped — "
-                                            "conversation is unchanged. Run /compress "
-                                            "to retry, /reset for a clean session, or "
-                                            "check your auxiliary.compression model "
-                                            "configuration."
+                                        logger.warning(
+                                            "Session hygiene compression aborted; "
+                                            "original transcript preserved: %s",
+                                            _err,
                                         )
-                                        try:
-                                            _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _warn_msg, metadata=_hyg_meta)
-                                        except Exception as _werr:
-                                            logger.warning(
-                                                "Failed to deliver compression-failure warning to user: %s",
-                                                _werr,
-                                            )
-                                    # Separately: if the user's CONFIGURED aux
-                                    # model failed and we recovered by falling
-                                    # back to the main model, tell them — a
-                                    # misconfigured auxiliary.compression.model
-                                    # is something only they can fix, and
-                                    # silent recovery would hide it.
+                                    # Separately log configured-aux recovery.
+                                    # Automatic hygiene must not add a second
+                                    # operational message to gateway chats.
                                     elif _comp is not None and getattr(_comp, "_last_aux_model_failure_model", None):
                                         _aux_model = getattr(_comp, "_last_aux_model_failure_model", "")
                                         _aux_err = getattr(_comp, "_last_aux_model_failure_error", None) or "unknown error"
-                                        _aux_msg = (
-                                            f"ℹ️ Configured compression model `{_aux_model}` "
-                                            f"failed ({_aux_err}). Recovered using your main "
-                                            "model — context is intact — but you may want to "
-                                            "check `auxiliary.compression.model` in config.yaml."
+                                        from agent.redact import redact_sensitive_text
+                                        _aux_err = redact_sensitive_text(_aux_err, force=True)
+                                        logger.warning(
+                                            "Configured compression model %s failed; "
+                                            "automatic hygiene recovered via fallback: %s",
+                                            _aux_model,
+                                            _aux_err,
                                         )
-                                        try:
-                                            _adapter = self._adapter_for_source(source)
-                                            if _adapter and source.chat_id:
-                                                await _adapter.send(source.chat_id, _aux_msg, metadata=_hyg_meta)
-                                        except Exception as _werr:
-                                            logger.warning(
-                                                "Failed to deliver aux-model-fallback notice to user: %s",
-                                                _werr,
-                                            )
                                 finally:
                                     # Evict the cached agent so the next turn
                                     # rebuilds its system prompt from current

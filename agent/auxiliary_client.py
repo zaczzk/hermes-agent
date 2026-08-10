@@ -1877,6 +1877,26 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     return api_key, base_url
 
 
+def _codex_quota_cooldown_active() -> bool:
+    """Return whether Codex OAuth is in a known quota cooldown.
+
+    A valid singleton token must not bypass a credential-pool 429 cooldown:
+    doing so retries a route that Hermes already knows cannot serve and turns
+    every auxiliary call into another warning/fallback cycle.
+    """
+    try:
+        from hermes_cli.auth import get_codex_auth_status
+
+        status = get_codex_auth_status()
+        if not status.get("rate_limited"):
+            return False
+        reset_at = status.get("reset_at")
+        return not isinstance(reset_at, (int, float)) or reset_at > time.time()
+    except Exception as exc:
+        logger.debug("Could not read Codex quota cooldown for auxiliary client: %s", exc)
+        return False
+
+
 def _read_codex_access_token() -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
@@ -1891,6 +1911,11 @@ def _read_codex_access_token() -> Optional[str]:
         token = _pool_runtime_api_key(entry)
         if token:
             return token
+        if _codex_quota_cooldown_active():
+            logger.debug(
+                "Codex OAuth is quota-exhausted; skipping singleton token fallback"
+            )
+            return None
 
     try:
         from hermes_cli.auth import _read_codex_tokens
@@ -4864,8 +4889,13 @@ def resolve_provider_client(
             # access to responses.stream() (e.g., the main agent loop).
             codex_token = _read_codex_access_token()
             if not codex_token:
-                logger.warning("resolve_provider_client: openai-codex requested "
-                               "but no Codex OAuth token found (run: hermes model)")
+                if _codex_quota_cooldown_active():
+                    logger.debug(
+                        "resolve_provider_client: openai-codex skipped during quota cooldown"
+                    )
+                else:
+                    logger.warning("resolve_provider_client: openai-codex requested "
+                                   "but no Codex OAuth token found (run: hermes model)")
                 return None, None
             final_model = _normalize_resolved_model(model, provider)
             raw_client = _create_openai_client(
@@ -4877,8 +4907,13 @@ def resolve_provider_client(
         # Standard path: wrap in CodexAuxiliaryClient adapter
         client, default = _build_codex_client(model)
         if client is None:
-            logger.warning("resolve_provider_client: openai-codex requested "
-                           "but no Codex OAuth token found (run: hermes model)")
+            if _codex_quota_cooldown_active():
+                logger.debug(
+                    "resolve_provider_client: openai-codex skipped during quota cooldown"
+                )
+            else:
+                logger.warning("resolve_provider_client: openai-codex requested "
+                               "but no Codex OAuth token found (run: hermes model)")
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
