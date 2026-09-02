@@ -1848,6 +1848,18 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
+        # ── Compaction retention telemetry ────────────────────────────
+        # If this path is a spilled (compacted) tool output and the read
+        # succeeded, record that the full text was re-read. Best-effort,
+        # consumes the registration, never changes the read's behavior.
+        # Design: tool-output-compaction-design.md (Gap B, v1 seam).
+        if not result_dict.get("error"):
+            try:
+                from tools.compaction_telemetry import record_retention_event
+                record_retention_event(resolved_str)
+            except Exception:
+                pass
+
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").
         # Cache the JSON we'd return so a retry skips the parent-dir walk.

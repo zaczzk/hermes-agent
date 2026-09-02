@@ -318,6 +318,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    session: str | None = None,
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -346,6 +347,7 @@ def maybe_persist_tool_result(
 
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    compacted_chars = len(preview)
 
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
@@ -357,6 +359,17 @@ def maybe_persist_tool_result(
             logger.info(
                 "Persisted large tool result: %s (%s, %d chars -> %s)",
                 tool_name, tool_use_id, len(content), host_path,
+            )
+            # Retention telemetry: register this spill so a later re-read
+            # (read_file on the spill path) records a retention event.
+            # Design: tool-output-compaction-design.md (Gap B / v1 seam).
+            # Best-effort — telemetry never affects compaction.
+            from tools.compaction_telemetry import record_persisted
+            record_persisted(
+                host_path, tool=tool_name,
+                original_chars=len(content),
+                compacted_chars=compacted_chars,
+                session=session,
             )
             return _build_persisted_message(preview, has_more, len(content), host_path)
     elif env is not None:
