@@ -143,9 +143,9 @@ class ResultStore:
         self._vacuum_expired()
 
     # ------------------------------------------------------------------- read
-    def get_record(self, result_id: Union[int, str]) -> Optional[dict]:
+    def get_record(self, result_id: Union[int, str], session_id: Optional[str] = "") -> Optional[dict]:
         self._vacuum_if_due()
-        row = self._row(result_id)
+        row = self._row(result_id, session_id=session_id)
         if row is None:
             return None
         keys = (
@@ -154,9 +154,17 @@ class ResultStore:
         )
         return dict(zip(keys, row))
 
-    def fetch(self, result_id: Union[int, str]) -> Optional[str]:
-        """Return the full text of a result; ``'last'`` = most recent."""
-        rec = self.get_record(result_id)
+    def fetch(self, result_id: Union[int, str], session_id: Optional[str] = "") -> Optional[str]:
+        """Return the full text of a result.
+
+        ``'last'`` = most recent result. When *session_id* is a non-empty
+        string (C14), id resolution is scoped to that session: ``'last'``
+        resolves within the session and a numeric id belonging to another
+        session is not returned. Legacy rows with an empty ``session_id``
+        remain visible to any session. Empty/None *session_id* preserves
+        the pre-C14 store-global behavior (default / explicit escape).
+        """
+        rec = self.get_record(result_id, session_id=session_id)
         if rec is None or not rec["full_path"]:
             return None
         try:
@@ -166,11 +174,26 @@ class ResultStore:
             return None
 
     # -------------------------------------------------------------- retention
-    def _row(self, result_id: Union[int, str]):
+    def _row(self, result_id: Union[int, str], session_id: Optional[str] = ""):
+        # C14: session-scoped lookups. A non-empty *session_id* restricts
+        # results to rows owned by that session plus legacy unowned rows
+        # (session_id IS NULL/''), preventing cross-session leakage in a
+        # shared DB. session_id=None keeps the store-global escape.
+        scope = ""
+        params: tuple = ()
+        # C14: only a non-empty *session_id* scopes the lookup (to that
+        # session plus legacy unowned rows). ""/None keep the store-global
+        # behavior for backward compatibility.
+        if session_id:
+            scope = " AND (session_id = ? OR session_id IS NULL OR session_id = '')"
+            params = (session_id,)
         if result_id == "last":
             cur = self._conn.execute(
                 "SELECT id, session_id, tool, args_json, created_at, full_path,"
-                " meta_json, size, sha256 FROM results ORDER BY id DESC LIMIT 1"
+                " meta_json, size, sha256 FROM results WHERE 1=1"
+                + scope
+                + " ORDER BY id DESC LIMIT 1",
+                params,
             )
         else:
             try:
@@ -179,8 +202,9 @@ class ResultStore:
                 return None
             cur = self._conn.execute(
                 "SELECT id, session_id, tool, args_json, created_at, full_path,"
-                " meta_json, size, sha256 FROM results WHERE id = ?",
-                (rid_int,),
+                " meta_json, size, sha256 FROM results WHERE id = ?"
+                + scope,
+                (rid_int,) + params,
             )
         return cur.fetchone()
 
@@ -256,8 +280,8 @@ def _cap(text: str) -> str:
 # query() — the compact verbs (design L62)
 # --------------------------------------------------------------------------
 
-def _read(store: ResultStore, result_id: Union[int, str]) -> str:
-    text = store.fetch(result_id)
+def _read(store: ResultStore, result_id: Union[int, str], session_id: Optional[str] = "") -> str:
+    text = store.fetch(result_id, session_id=session_id)
     if text is None:
         raise LookupError(f"result {result_id!r} not found")
     return text
@@ -269,13 +293,18 @@ def query(
     verb: str,
     pattern: Optional[str] = None,
     n: Optional[Union[int, Tuple[int, int]]] = None,
+    session_id: Optional[str] = "",
 ) -> str:
-    """Run one compact verb over a stored result. Budget-capped output (L72)."""
+    """Run one compact verb over a stored result. Budget-capped output (L72).
+
+    When *session_id* is a non-empty string, id resolution is scoped to that
+    session (C14); ``None`` preserves the store-global escape.
+    """
     if verb not in VERBS:
         raise ValueError(
             f"unknown verb {verb!r}; expected one of {', '.join(VERBS)}"
         )
-    text = _read(store, result_id)
+    text = _read(store, result_id, session_id=session_id)
     lines = text.splitlines()
 
     if verb == "grep":

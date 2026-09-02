@@ -31,6 +31,34 @@ def _get_store() -> ResultStore:
         return _store
 
 
+def _current_session_id() -> str:
+    """Best-effort session scoping (C14), contextvars only.
+
+    Resolution: approval observability contextvar, then the gateway
+    session-context ContextVar. No os.environ fallback: the env var is a
+    durable session id (CLI sessions) that never matches ingest-time
+    scoping and would leak across test processes. No contextvar set (CLI,
+    cron, tests) → returns "" → the store-global legacy path.
+    """
+    try:
+        from tools.approval import _approval_session_id
+
+        sid = _approval_session_id.get()
+        if sid:
+            return sid
+    except Exception:
+        pass
+    try:
+        from gateway.session_context import _SESSION_ID, _UNSET
+
+        value = _SESSION_ID.get()
+        if value is not _UNSET and value:
+            return value
+    except Exception:
+        pass
+    return ""
+
+
 def result_query_tool(
     id: Union[int, str] = "last",
     verb: str = "summary",
@@ -42,7 +70,7 @@ def result_query_tool(
 
     Args:
         id: result id (from a spill footer) or ``"last"`` for the most
-            recent result of this session.
+            recent result of this session (session-scoped, C14).
         verb: one of grep|errors|head|tail|count|lines|json|summary.
         pattern: for grep/count (substring or regex) or json (dot path).
         n: for head/tail (line count) or lines (1-based line number; pass
@@ -51,7 +79,11 @@ def result_query_tool(
     try:
         store = _get_store()
         n_arg = _lines_range if _lines_range is not None else n
-        return query(store, id, verb, pattern=pattern, n=n_arg)
+        session = _current_session_id() or None
+        # No session context (CLI/tests) → session_id=None preserves the
+        # legacy store-global behavior exactly.
+        return query(store, id, verb, pattern=pattern, n=n_arg,
+                     session_id=session)
     except LookupError as exc:
         return f"result_query error: {exc}"
     except ValueError as exc:

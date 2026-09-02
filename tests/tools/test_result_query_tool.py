@@ -194,6 +194,71 @@ class TestBudgetCap:
         assert not truncated
 
 
+class TestSessionScoping:
+    """C14: id lookups are session-scoped, not store-global.
+
+    "last" and numeric ids resolve within the calling session first; a
+    result owned by another session is never returned. Legacy rows with an
+    empty session_id (CLI ingests) remain visible as the explicit
+    store-global escape; passing session_id=None preserves old behavior.
+    """
+
+    def test_last_resolves_within_calling_session(self, store):
+        store.ingest(full_text="s1 result", tool="terminal", args_json={}, session_id="s1")
+        store.ingest(full_text="s2 result", tool="terminal", args_json={}, session_id="s2")
+        assert store.fetch("last", session_id="s1") == "s1 result"
+        assert store.fetch("last", session_id="s2") == "s2 result"
+
+    def test_last_missing_session_falls_back_empty(self, store):
+        store.ingest(full_text="s1 result", tool="terminal", args_json={}, session_id="s1")
+        assert store.fetch("last", session_id="s9") is None
+
+    def test_numeric_id_owned_by_other_session_not_returned(self, store):
+        rid_other = store.ingest(full_text="other session", tool="terminal",
+                                 args_json={}, session_id="s2")
+        assert store.fetch(rid_other, session_id="s1") is None
+        assert store.get_record(rid_other, session_id="s1") is None
+
+    def test_numeric_id_same_session_returns(self, store):
+        rid = store.ingest(full_text="mine", tool="terminal", args_json={}, session_id="s1")
+        assert store.fetch(rid, session_id="s1") == "mine"
+
+    def test_unowned_legacy_row_still_visible(self, store):
+        rid = store.ingest(full_text="cli ingest", tool="terminal", args_json={})
+        assert store.fetch(rid, session_id="s1") == "cli ingest"
+
+    def test_empty_or_none_session_id_preserves_global_behavior(self, store):
+        store.ingest(full_text="s1 result", tool="terminal", args_json={}, session_id="s1")
+        store.ingest(full_text="s2 result", tool="terminal", args_json={}, session_id="s2")
+        assert store.fetch("last") == "s2 result"
+        assert store.fetch("last", session_id=None) == "s2 result"
+
+    def test_query_verb_scoped(self, store):
+        store.ingest(full_text="ERROR from s1", tool="terminal", args_json={}, session_id="s1")
+        store.ingest(full_text="ERROR from s2", tool="terminal", args_json={}, session_id="s2")
+        out = query(store, "last", "errors", session_id="s1")
+        assert "s1" in out and "s2" not in out
+
+    def test_tool_handler_uses_session_context(self, tmp_path, monkeypatch):
+        import tools.result_query_tool as rqm
+        from tools.approval import (
+            reset_current_observability_context,
+            set_current_observability_context,
+        )
+        store = ResultStore(str(tmp_path / "r.sqlite"))
+        monkeypatch.setattr(rqm, "_store", store)
+        store.ingest(full_text="mine\nERROR a", tool="terminal",
+                     args_json={}, session_id="sess-a")
+        store.ingest(full_text="theirs\nERROR b", tool="terminal",
+                     args_json={}, session_id="sess-b")
+        tokens = set_current_observability_context(session_id="sess-a")
+        try:
+            out = rqm.result_query_tool(id="last", verb="grep", pattern="ERROR")
+            assert "ERROR a" in out and "ERROR b" not in out
+        finally:
+            reset_current_observability_context(tokens)
+
+
 class TestToolHandler:
     """The registered model-tool surface (tools.result_query_tool)."""
 
