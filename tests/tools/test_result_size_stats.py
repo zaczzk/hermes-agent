@@ -52,7 +52,7 @@ class TestResultSizeStats:
         term = stats["terminal"]
         assert term["count"] == 2
         assert term["before"]["max"] == 40_000
-        assert term["after"]["max"] == 2_000
+        assert term["after"]["max"] == 800
         web = stats["web_extract"]
         assert web["count"] == 1
         # single sample: no percentile claim, max only
