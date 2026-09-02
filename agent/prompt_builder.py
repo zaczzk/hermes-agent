@@ -1702,8 +1702,23 @@ def _skill_should_show(
     conditions: dict,
     available_tools: "set[str] | None",
     available_toolsets: "set[str] | None",
+    session_platform: "str | None" = None,
 ) -> bool:
     """Return False if the skill's conditional activation rules exclude it."""
+    # Gateway-channel gate: independent of tool filtering info, because a
+    # channel-specific skill (e.g. teams-meeting-pipeline) is noise on every
+    # other channel regardless of what tools are available. Fail-open when
+    # the session platform is unknown (offline builds, tests) — hiding a
+    # skill someone might need is worse than one spare index line.
+    wanted_platforms = [
+        str(p).strip().lower()
+        for p in (conditions.get("session_platforms") or [])
+        if str(p).strip()
+    ]
+    if wanted_platforms and session_platform:
+        if session_platform.strip().lower() not in wanted_platforms:
+            return False
+
     if available_tools is None and available_toolsets is None:
         return True  # No filtering info — show everything (backward compat)
 
@@ -1763,7 +1778,8 @@ def build_skills_system_prompt(
     External skill directories (``skills.external_dirs`` in config.yaml) are
     scanned alongside the local ``~/.hermes/skills/`` directory.  External dirs
     are read-only — they appear in the index but new skills are always created
-    in the local dir.  Local skills take precedence when names collide.
+    in the local dir (or ``skills.create_dir`` when configured).  Local skills
+    take precedence when names collide.
 
     ``compact_categories`` (e.g. from the coding posture — see
     agent/coding_context.py) demotes whole categories to a names-only line in
@@ -1864,6 +1880,7 @@ def _build_skills_system_prompt_inner(
                 entry.get("conditions") or {},
                 available_tools,
                 available_toolsets,
+                _platform_hint or None,
             ):
                 continue
             visible_entries.append(entry)
@@ -1886,6 +1903,7 @@ def _build_skills_system_prompt_inner(
                 extract_skill_conditions(frontmatter),
                 available_tools,
                 available_toolsets,
+                _platform_hint or None,
             ):
                 continue
             visible_entries.append(entry)
@@ -1917,6 +1935,7 @@ def _build_skills_system_prompt_inner(
                         extract_skill_conditions(frontmatter),
                         available_tools,
                         available_toolsets,
+                        _platform_hint or None,
                     ):
                         continue
                     project_names.add(fm_name)
@@ -2016,6 +2035,7 @@ def _build_skills_system_prompt_inner(
                     extract_skill_conditions(frontmatter),
                     available_tools,
                     available_toolsets,
+                    _platform_hint or None,
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)

@@ -613,6 +613,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    capabilities: Optional[Dict[str, bool]] = None,
 ):
     """
     Initialize the AI Agent.
@@ -712,6 +713,10 @@ def init_agent(
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
     )
+    agent.capabilities = {
+        key: value for key, value in (capabilities or {}).items()
+        if isinstance(key, str) and isinstance(value, bool)
+    }
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
@@ -1342,8 +1347,8 @@ def init_agent(
             elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                 client_kwargs["default_headers"] = _ra()._qwen_portal_headers()
             elif base_url_host_matches(effective_base, "chatgpt.com"):
-                from agent.auxiliary_client import _codex_cloudflare_headers
-                client_kwargs["default_headers"] = _codex_cloudflare_headers(
+                from agent.codex_headers import codex_cloudflare_headers
+                client_kwargs["default_headers"] = codex_cloudflare_headers(
                     api_key, base_url=effective_base,
                 )
             elif base_url_host_matches(effective_base, "x.ai"):
@@ -1385,14 +1390,71 @@ def init_agent(
                 if _routed_headers:
                     client_kwargs["default_headers"] = dict(_routed_headers)
             else:
-                # When the user explicitly chose a non-OpenRouter provider
-                # but no credentials were found, fail fast with a clear
-                # message instead of silently routing through OpenRouter.
+                # No credentials resolved for the configured provider.  Give
+                # the user-configured fallback chain a chance BEFORE failing
+                # (#17929) — regardless of WHICH provider failed.  An
+                # exhausted single-entry pool (typically ``openrouter``
+                # under free-tier daily quotas) must still reach the chain
+                # instead of dying at init with a misleading "No LLM
+                # provider configured" error.  Only providers explicitly
+                # chosen by name keep the dedicated missing-key diagnostic.
                 _explicit = (agent.provider or "").strip().lower()
-                if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
-                    # Look up the actual env var name from the provider
-                    # config — some providers use non-standard names
-                    # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
+                # --- Init-time fallback (#17929) ---
+                _fb_entries = []
+                if isinstance(fallback_model, list):
+                    _fb_entries = [
+                        f for f in fallback_model
+                        if isinstance(f, dict) and f.get("provider") and f.get("model")
+                    ]
+                elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+                    _fb_entries = [fallback_model]
+                _fb_resolved = False
+                for _fb in _fb_entries:
+                    try:
+                        from hermes_cli.fallback_config import resolve_entry_api_key
+                        _fb_explicit_key = resolve_entry_api_key(_fb)
+                        _fb_client, _fb_model = resolve_provider_client(
+                            _fb["provider"], model=_fb["model"], raw_codex=True,
+                            explicit_base_url=_fb.get("base_url"),
+                            explicit_api_key=_fb_explicit_key,
+                        )
+                    except Exception as _fb_exc:
+                        logger.debug(
+                            "Init-time fallback entry %s failed: %s",
+                            _fb.get("provider"), _fb_exc,
+                        )
+                        continue
+                    if _fb_client is not None:
+                        agent.provider = _fb["provider"]
+                        agent.model = _fb_model or _fb["model"]
+                        agent._fallback_activated = True
+                        client_kwargs = {
+                            "api_key": _fb_client.api_key,
+                            "base_url": str(_fb_client.base_url),
+                        }
+                        if _provider_timeout is not None:
+                            client_kwargs["timeout"] = _provider_timeout
+                        _fb_headers = getattr(_fb_client, "_custom_headers", None)
+                        if not _fb_headers:
+                            _fb_headers = getattr(_fb_client, "default_headers", None)
+                        if not _fb_headers:
+                            _fb_headers = getattr(_fb_client, "_default_headers", None)
+                        if _fb_headers:
+                            client_kwargs["default_headers"] = dict(_fb_headers)
+                        _fb_resolved = True
+                        break
+                if (
+                    not _fb_resolved
+                    and _explicit
+                    and _explicit not in {"auto", "openrouter", "custom"}
+                ):
+                    # Explicitly chosen non-OpenRouter provider with neither
+                    # credentials nor a usable fallback: fail fast with a
+                    # clear message instead of silently routing through
+                    # OpenRouter.  Look up the actual env var name from the
+                    # provider config — some providers use non-standard
+                    # names (e.g. alibaba → DASHSCOPE_API_KEY, not
+                    # ALIBABA_API_KEY).
                     _env_hint = f"{_explicit.upper()}_API_KEY"
                     try:
                         from hermes_cli.auth import PROVIDER_REGISTRY
@@ -1401,56 +1463,11 @@ def init_agent(
                             _env_hint = _pcfg.api_key_env_vars[0]
                     except Exception:
                         pass
-                    # --- Init-time fallback (#17929) ---
-                    _fb_entries = []
-                    if isinstance(fallback_model, list):
-                        _fb_entries = [
-                            f for f in fallback_model
-                            if isinstance(f, dict) and f.get("provider") and f.get("model")
-                        ]
-                    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-                        _fb_entries = [fallback_model]
-                    _fb_resolved = False
-                    for _fb in _fb_entries:
-                        try:
-                            from hermes_cli.fallback_config import resolve_entry_api_key
-                            _fb_explicit_key = resolve_entry_api_key(_fb)
-                            _fb_client, _fb_model = resolve_provider_client(
-                                _fb["provider"], model=_fb["model"], raw_codex=True,
-                                explicit_base_url=_fb.get("base_url"),
-                                explicit_api_key=_fb_explicit_key,
-                            )
-                        except Exception as _fb_exc:
-                            logger.debug(
-                                "Init-time fallback entry %s failed: %s",
-                                _fb.get("provider"), _fb_exc,
-                            )
-                            continue
-                        if _fb_client is not None:
-                            agent.provider = _fb["provider"]
-                            agent.model = _fb_model or _fb["model"]
-                            agent._fallback_activated = True
-                            client_kwargs = {
-                                "api_key": _fb_client.api_key,
-                                "base_url": str(_fb_client.base_url),
-                            }
-                            if _provider_timeout is not None:
-                                client_kwargs["timeout"] = _provider_timeout
-                            _fb_headers = getattr(_fb_client, "_custom_headers", None)
-                            if not _fb_headers:
-                                _fb_headers = getattr(_fb_client, "default_headers", None)
-                            if not _fb_headers:
-                                _fb_headers = getattr(_fb_client, "_default_headers", None)
-                            if _fb_headers:
-                                client_kwargs["default_headers"] = dict(_fb_headers)
-                            _fb_resolved = True
-                            break
-                    if not _fb_resolved:
-                        raise RuntimeError(
-                            f"Provider '{_explicit}' is set in config.yaml but no API key "
-                            f"was found. Set the {_env_hint} environment "
-                            f"variable, or switch to a different provider with `hermes model`."
-                        )
+                    raise RuntimeError(
+                        f"Provider '{_explicit}' is set in config.yaml but no API key "
+                        f"was found. Set the {_env_hint} environment "
+                        f"variable, or switch to a different provider with `hermes model`."
+                    )
                 if not getattr(agent, "_fallback_activated", False):
                     # No provider configured — reject with a clear message.
                     raise RuntimeError(
@@ -2337,21 +2354,22 @@ def init_agent(
     codex_responses_native_compaction = _is_truthy(
         _compression_cfg.get("codex_responses_native", False)
     )
-    _native_threshold_raw = _compression_cfg.get(
-        "codex_responses_compact_threshold", 200_000
-    )
-    try:
-        if isinstance(_native_threshold_raw, bool):
-            raise ValueError
-        codex_responses_compact_threshold = int(_native_threshold_raw)
-        if codex_responses_compact_threshold <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        _ra().logger.warning(
-            "Invalid compression.codex_responses_compact_threshold=%r; using 200000.",
-            _native_threshold_raw,
-        )
-        codex_responses_compact_threshold = 200_000
+    _native_threshold_raw = _compression_cfg.get("codex_responses_compact_threshold")
+    codex_responses_compact_threshold = None
+    if _native_threshold_raw is not None:
+        try:
+            if isinstance(_native_threshold_raw, (bool, float)):
+                raise ValueError
+            codex_responses_compact_threshold = int(_native_threshold_raw)
+            if codex_responses_compact_threshold <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            _ra().logger.warning(
+                "Invalid compression.codex_responses_compact_threshold=%r; "
+                "using the automatic threshold derived from local compression.",
+                _native_threshold_raw,
+            )
+            codex_responses_compact_threshold = None
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2771,6 +2789,34 @@ def init_agent(
         if not agent.quiet_mode:
             _ra().logger.info("Using context engine: %s", _selected_engine.name)
     else:
+        # Native Gemini output reservation (#57275 claim 4): when
+        # model.max_tokens is unset, the native generateContent adapter does
+        # NOT run uncapped — it sends maxOutputTokens=65,535
+        # (GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, see
+        # _effective_gemini_max_output_tokens). The compressor's threshold is
+        # pct×(window − max_tokens); passing None here meant it reserved 0
+        # while the wire reserved 65,535, so on a 128K window the trigger
+        # landed at ~96K against a real safe input budget of ~65K and the
+        # provider 400'd before compaction fired. Mirror the adapter's
+        # default so the reservation matches what is actually sent. The
+        # generic provider-default gap is #63839; this wires only the native
+        # Gemini path, where the default is a documented constant.
+        _compressor_max_tokens = agent.max_tokens
+        if _compressor_max_tokens is None:
+            try:
+                from agent.gemini_native_adapter import (
+                    GEMINI_DEFAULT_MAX_OUTPUT_TOKENS,
+                    is_native_gemini_base_url,
+                )
+                _gemini_provider = str(
+                    getattr(agent, "provider", "") or ""
+                ).strip().lower() in {
+                    "gemini", "google", "google-gemini", "google-ai-studio",
+                }
+                if _gemini_provider or is_native_gemini_base_url(agent.base_url):
+                    _compressor_max_tokens = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+            except Exception:
+                pass
         agent.context_compressor = ContextCompressor(
             model=agent.model,
             threshold_percent=compression_threshold,
@@ -2785,7 +2831,7 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
-            max_tokens=agent.max_tokens,
+            max_tokens=_compressor_max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,
             proactive_prune_tokens=compression_proactive_prune_tokens,
@@ -2829,6 +2875,13 @@ def init_agent(
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
+    from agent.native_compaction import resolve_native_compaction_capabilities
+    agent.runtime_capabilities = resolve_native_compaction_capabilities(
+        model=agent.model,
+        base_url=agent.base_url,
+        provider=agent.provider,
+        is_codex_backend=(agent.provider or "").strip().lower() == "openai-codex",
+    )
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
@@ -2958,6 +3011,7 @@ def init_agent(
     # until the first response with usage; invalidated on compaction and
     # session switches so stale anchors can never suppress compression.
     agent._usage_anchor = None
+    agent._turn_base_usage_anchor = None
 
     # Cumulative token usage for the session
     agent.session_prompt_tokens = 0
@@ -2972,6 +3026,12 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
+    # Rolling history for status-bar avg latency / velocity (last 10 calls).
+    # Stored on the agent so both conversation_loop and codex_runtime share it
+    # and the CLI snapshot can read it without extra IPC.
+    from collections import deque as _deque
+    agent._api_latency_history = _deque(maxlen=10)
+    agent._api_output_history = _deque(maxlen=10)
     
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.
@@ -3020,6 +3080,36 @@ def init_agent(
         _ra().logger.info(
             "Ollama num_ctx: will request %d tokens (model max from /api/show)",
             agent._ollama_num_ctx,
+        )
+    # ── Recalibrate the compressor to the served window (#57275 claim 3) ──
+    # The compressor was constructed ABOVE this block from the probed model
+    # window (GGUF metadata can advertise 256K+), but every request below
+    # runs at num_ctx. A config that sets only model.ollama_num_ctx (without
+    # model.context_length) previously left the compressor targeting the
+    # probed window while the server truncated/rejected at num_ctx — the
+    # compaction trigger could sit several times ABOVE the real served
+    # window and never fire. Clamp the compressor's window to the effective
+    # num_ctx so threshold math operates on the context the server actually
+    # serves. (Overlaps #60103's silent-clamp dead zone; this is the
+    # init-order half.)
+    _cc_window = getattr(agent.context_compressor, "context_length", 0) or 0
+    if (
+        agent._ollama_num_ctx
+        and agent._ollama_num_ctx > 0
+        and _cc_window
+        and agent._ollama_num_ctx < _cc_window
+    ):
+        _ra().logger.info(
+            "Compressor window clamped to Ollama num_ctx: %d -> %d",
+            _cc_window, agent._ollama_num_ctx,
+        )
+        agent.context_compressor.update_model(
+            model=agent.model,
+            context_length=agent._ollama_num_ctx,
+            base_url=agent.base_url,
+            api_key=getattr(agent, "api_key", ""),
+            provider=agent.provider,
+            api_mode=agent.api_mode,
         )
 
     # Codex gpt-5.x autoraise notice: show at most once per profile/config
@@ -3099,6 +3189,7 @@ def init_agent(
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,

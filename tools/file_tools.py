@@ -1848,6 +1848,18 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
+        # ── Compaction retention telemetry ────────────────────────────
+        # If this path is a spilled (compacted) tool output and the read
+        # succeeded, record that the full text was re-read. Best-effort,
+        # consumes the registration, never changes the read's behavior.
+        # Design: tool-output-compaction-design.md (Gap B, v1 seam).
+        if not result_dict.get("error"):
+            try:
+                from tools.compaction_telemetry import record_retention_event
+                record_retention_event(resolved_str)
+            except Exception:
+                pass
+
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").
         # Cache the JSON we'd return so a retry skips the parent-dir walk.
@@ -1963,11 +1975,29 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # truncated (large file with more content than limit covered).
         # Outside the _read_tracker_lock so the registry's own locking
         # isn't nested under ours.
+        _partial = (offset > 1) or bool(result_dict.get("truncated"))
         try:
-            _partial = (offset > 1) or bool(result_dict.get("truncated"))
             file_state.record_read(task_id, resolved_str, partial=_partial)
         except Exception:
             logger.debug("file_state.record_read failed", exc_info=True)
+
+        # Background-review read-before-write guard integration (#61521):
+        # when the self-improvement review fork reads a skill file with
+        # read_file (now whitelisted dispatch-side), register the read the
+        # same way skill_view does, so a follow-up
+        # skill_manage(action='patch') on the loaded file is accepted.
+        # A partial read doesn't count — the guard requires the CURRENT
+        # full content to have been seen. No-op outside review forks
+        # (mark_background_review_skill_read gates on is_background_review).
+        if not _partial:
+            try:
+                from tools.skill_manager_tool import mark_background_review_skill_read
+
+                mark_background_review_skill_read(Path(resolved_str))
+            except Exception:
+                logger.debug(
+                    "background-review read-mark failed", exc_info=True
+                )
 
         if count >= 4:
             # Hard block: stop returning content to break the loop
