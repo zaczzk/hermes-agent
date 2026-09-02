@@ -142,6 +142,64 @@ def record_retention_event(spill_path: str | None) -> None:
         logger.debug("compaction telemetry event failed: %s", exc)
 
 
+def _nearest_rank(sorted_values: list[int], pct: float) -> int:
+    """Nearest-rank percentile of pre-sorted values."""
+    import math
+
+    rank = max(1, math.ceil(pct * len(sorted_values)))
+    return int(sorted_values[rank - 1])
+
+
+def result_size_stats() -> dict:
+    """Per-tool p95-bytes-per-result over the retention JSONL log.
+
+    Design source: tool-output-compaction-design.md L87 — "per-tool
+    observation-size telemetry (add p95-bytes-per-result to Hermes
+    performance diagnostics before/after)". "Before" = original_chars
+    (pre-compaction spill size); "after" = compacted_chars (what entered
+    context). Computed lazily at read time — the compaction hot path only
+    does the existing O(1) registry insert, nothing here runs per result.
+
+    Returns {tool: {"count": n, "before": {...}, "after": {...}}} where
+    each size block has "max" always and "p95" only when count >= 2.
+    Best-effort: a missing or unreadable log yields {}.
+    """
+    per_tool: dict[str, dict[str, list[int]]] = {}
+    try:
+        path = get_jsonl_path()
+        if not path.exists():
+            return {}
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                tool = str(event.get("tool") or "unknown")
+                bucket = per_tool.setdefault(
+                    tool, {"before": [], "after": []})
+                bucket["before"].append(int(event.get("original_chars", 0) or 0))
+                bucket["after"].append(int(event.get("compacted_chars", 0) or 0))
+    except Exception as exc:
+        logger.debug("result size stats read failed: %s", exc)
+        return {}
+
+    stats: dict = {}
+    for tool, sizes in per_tool.items():
+        entry: dict = {"count": len(sizes["before"])}
+        for label in ("before", "after"):
+            values = sorted(sizes[label])
+            block = {"max": values[-1] if values else 0}
+            if len(values) >= 2:
+                block["p95"] = _nearest_rank(values, 0.95)
+            entry[label] = block
+        stats[tool] = entry
+    return stats
+
+
 def compaction_stats() -> dict:
     """Return hit-rate totals over the retention JSONL log.
 
