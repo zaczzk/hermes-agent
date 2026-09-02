@@ -227,10 +227,11 @@ class TestSessionScoping:
         rid = store.ingest(full_text="cli ingest", tool="terminal", args_json={})
         assert store.fetch(rid, session_id="s1") == "cli ingest"
 
-    def test_none_session_id_preserves_global_behavior(self, store):
+    def test_empty_or_none_session_id_preserves_global_behavior(self, store):
         store.ingest(full_text="s1 result", tool="terminal", args_json={}, session_id="s1")
         store.ingest(full_text="s2 result", tool="terminal", args_json={}, session_id="s2")
         assert store.fetch("last") == "s2 result"
+        assert store.fetch("last", session_id=None) == "s2 result"
 
     def test_query_verb_scoped(self, store):
         store.ingest(full_text="ERROR from s1", tool="terminal", args_json={}, session_id="s1")
