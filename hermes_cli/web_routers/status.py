@@ -493,6 +493,8 @@ async def get_status(profile: Optional[str] = None):
                 gateway_running=gateway_running, gateway_state=gateway_state),
             "restart_drain_timeout": restart_drain_timeout, "active_sessions": active_sessions,
             **auth, "nous_session_valid": _nous_session_validity()}
+        from passive_history_ingress import capabilities as passive_capabilities
+        status["passive_history"] = passive_capabilities()
 
         # Stable per-install identity (first call may touch disk). Omitted (not null) when
         # unpersistable so older-client behavior and the no-identity fallback stay identical.

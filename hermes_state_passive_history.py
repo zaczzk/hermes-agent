@@ -296,7 +296,7 @@ class SessionPassiveHistoryMixin:
             json.dumps(list(message_ids)), time.time())).lastrowid
 
     def append_passive_messages(self, session_id: str, *, producer: str, event_id: str,
-        origin_turn_id: str, messages: List[Dict[str, str]],
+        origin_turn_id: str, messages: List[Dict[str, str]], _commit_guard=None,
     ) -> PassiveHistoryReceipt:
         """Commit one finalized external turn (or ``[user, assistant]`` pair) without running the agent.
 
@@ -323,6 +323,10 @@ class SessionPassiveHistoryMixin:
         fingerprint = _payload_fingerprint(origin_turn_id, rows)
 
         def _do(conn) -> PassiveHistoryReceipt:
+            # The authenticated transport's attachment generation must be fenced inside this
+            # same writer transaction, serialized against tab replacement and detach.
+            if _commit_guard is not None:
+                _commit_guard(conn)
             receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
             if receipt is not None:
                 self._verify_passive_receipt(conn, receipt, producer=producer, event_id=event_id)
@@ -370,6 +374,26 @@ class SessionPassiveHistoryMixin:
         # Same patience as every other transcript writer: a sibling holding the lock for seconds
         # (VACUUM, checkpoint) must not turn into a lost user turn.
         return self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+
+    def get_passive_history_receipt(self, session_id: str, *, producer: str,
+        event_id: str,
+    ) -> Optional[PassiveHistoryReceipt]:
+        """Reconcile an event without write authority or a new append after response loss."""
+        producer = _validated_identifier(producer, "producer", _PRODUCER_MAX_CHARS)
+        event_id = _validated_identifier(event_id, "event_id", _EVENT_MAX_CHARS)
+        with self._read_ctx() as conn:
+            receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
+            if receipt is None:
+                self._passive_conversation_id(conn, session_id)
+                return None
+            self._verify_passive_receipt(conn, receipt, producer=producer, event_id=event_id)
+            if self._passive_conversation_id(conn, session_id) != str(receipt["conversation_id"]):
+                raise PassiveHistoryConflictError("Event belongs to another conversation")
+            return PassiveHistoryReceipt(
+                producer=producer, event_id=event_id, origin_turn_id=str(receipt["origin_turn_id"]),
+                conversation_id=str(receipt["conversation_id"]), session_id=str(receipt["session_id"]),
+                message_ids=_committed_message_ids(receipt["message_ids_json"]),
+                revision=int(receipt["id"]), replayed=True)
 
     def get_passive_history_watermark(self, session_id: str) -> PassiveHistoryWatermark:
         """External-history generation for *session_id*'s conversation.

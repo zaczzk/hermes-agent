@@ -944,6 +944,7 @@ from hermes_cli.web_routers import (  # noqa: E402
     actions as _actions_routes,
     audio as _audio_routes,
     sessions as _sessions_routes,
+    passive_history as _passive_history_routes,
     profiles as _profiles_routes,
     memory_providers as _memory_providers_routes,
     config_env as _config_env_routes,
@@ -968,6 +969,7 @@ app.include_router(_actions_routes.router)
 app.include_router(_audio_routes.router)
 app.include_router(_actions_routes.status_router)
 app.include_router(_sessions_routes.list_router)
+app.include_router(_passive_history_routes.router)
 app.include_router(_profiles_routes.sessions_router)
 app.include_router(_sessions_routes.search_router)
 app.include_router(_memory_providers_routes.router)

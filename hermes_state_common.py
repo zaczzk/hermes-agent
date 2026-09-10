@@ -236,7 +236,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})")
 
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -427,6 +427,28 @@ CREATE TABLE IF NOT EXISTS messages (
     display_identity BLOB,
     display_order INTEGER
 );
+
+-- Transport authority is revocable and host-epoch-bound. Unlike durable event receipts below,
+-- these rows cascade on retention and are deliberately not copied by database recovery.
+CREATE TABLE IF NOT EXISTS passive_history_attachments (
+    profile_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    tab_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    host_epoch TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    snapshot_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    PRIMARY KEY (profile_id, principal_id, tab_id)
+);
+CREATE TRIGGER IF NOT EXISTS passive_attachments_message_delete
+AFTER DELETE ON messages
+BEGIN
+    DELETE FROM passive_history_attachments
+    WHERE session_id = OLD.session_id OR conversation_id = OLD.session_id
+       OR snapshot_session_id = OLD.session_id;
+END;
 
 -- Idempotency receipts for passively saved conversation turns (Talk voice ingress and any other
 -- trusted host producer). Identity is (producer, event_id) — never content — so an equal retry
