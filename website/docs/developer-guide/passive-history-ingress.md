@@ -32,6 +32,9 @@ current `session_id`, `messages`, `truncated`, and capabilities. Preserve the ou
 as the original selected target; a compression successor inside the snapshot is not a target switch.
 Snapshots contain at most 20 recent user/assistant text rows and 32 KiB combined UTF-8 text.
 They omit system prompts, tools, configuration, API sidecars and non-text payloads.
+Compaction handoffs use the canonical session display projection: internal summaries are removed,
+while genuine earlier text inside a merged carrier remains visible. Internal notification kinds
+and empty text rows are omitted; multibyte truncation never fabricates empty messages.
 
 Example commit, using identity fields returned by attach:
 

@@ -111,28 +111,43 @@ class PassiveHistoryIngress:
         return row
 
     def _snapshot_data(self, db, conn, session_id, conversation_id):
+        from agent.compaction_display import project_compaction_message_for_display
+        from agent.prompt_builder import STEER_DISPLAY_KIND
+        from hermes_state_passive_history import PASSIVE_HISTORY_DISPLAY_KIND
+
         tip = db._resolve_passive_history_tip(
             conn, conversation_id, requested_session_id=session_id)
         rows = conn.execute(
-            "SELECT id, role, content, display_kind FROM messages "
+            "SELECT id, role, content, display_kind, _compressed_summary FROM messages "
             "WHERE session_id=? AND active=1 AND role IN ('user','assistant') "
-            "AND COALESCE(display_kind,'') != 'hidden' ORDER BY id DESC LIMIT ?",
+            "ORDER BY id DESC LIMIT ?",
             (tip, MAX_SNAPSHOT_MESSAGES + 1)).fetchall()
         truncated = len(rows) > MAX_SNAPSHOT_MESSAGES
         messages, remaining = [], MAX_SNAPSHOT_BYTES
         for row in rows[:MAX_SNAPSHOT_MESSAGES]:
-            content = db._decode_content(row["content"])
+            message = project_compaction_message_for_display(
+                {**dict(row), "content": db._decode_content(row["content"])})
+            if message is None or message.get("display_kind") not in (
+                None, "", STEER_DISPLAY_KIND, PASSIVE_HISTORY_DISPLAY_KIND,
+            ):
+                truncated = True
+                continue
+            content = message.get("content")
             if not isinstance(content, str):
                 truncated = True
                 continue
             encoded = content.encode("utf-8")
-            if len(encoded) > remaining:
+            clipped = len(encoded) > remaining
+            if clipped:
                 encoded = encoded[:remaining]
                 truncated = True
             text = encoded.decode("utf-8", errors="ignore")
-            messages.append({"id": row["id"], "role": row["role"], "content": text})
+            if text:
+                messages.append({"id": row["id"], "role": row["role"], "content": text})
+            else:
+                truncated = True
             remaining -= len(text.encode("utf-8"))
-            if remaining == 0:
+            if clipped or remaining <= 0:
                 truncated = True
                 break
         return {

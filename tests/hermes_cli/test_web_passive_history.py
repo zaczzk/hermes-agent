@@ -9,16 +9,16 @@ def test_dashboard_auth_restart_and_profile_isolation(tmp_path, monkeypatch):
     from hermes_cli import web_server
     from hermes_cli.web_routers import passive_history as routes
 
-    paths = {name: tmp_path / f"{name}.db" for name in ("alpha", "beta")}
+    root = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    paths = {name: root / "profiles" / name / "state.db" for name in ("alpha", "beta")}
     for path in paths.values():
+        path.parent.mkdir(parents=True)
         db = SessionDB(path)
         db.create_session("same-id", source="test")
         db.close()
     monkeypatch.setattr(web_server, "_SESSION_TOKEN", "dashboard-test-token")
     monkeypatch.setattr(web_server.app.state, "auth_required", False, raising=False)
-    monkeypatch.setattr(routes, "_cron_profile_home", lambda name: (name, tmp_path / name))
-    monkeypatch.setattr(routes, "_open_session_db_for_profile",
-                        lambda profile, read_only: SessionDB(paths[profile], read_only=read_only))
     monkeypatch.setattr(routes, "service", PassiveHistoryIngress())
 
     def forbidden(*args, **kwargs):

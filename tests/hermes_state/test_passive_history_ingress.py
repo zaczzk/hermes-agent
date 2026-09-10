@@ -1,5 +1,6 @@
 """Real SQLite attachment fencing and response-loss reconciliation."""
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 from threading import Event
 
 import pytest
@@ -162,3 +163,71 @@ def test_snapshot_is_bounded_display_context(store):
     assert sum(len(m["content"].encode()) for m in snapshot["messages"]) <= 32 * 1024
     assert all(m["role"] == "user" for m in snapshot["messages"])
     assert snapshot["capabilities"]["origin_adoption"] is False
+
+
+def test_schema_31_upgrade_replays_attachment_ddl(tmp_path):
+    path = tmp_path / "upgrade.db"
+    old = SessionDB(path)
+    old.create_session("original", source="test")
+    # Schema 31 differs by the absence of the additive attachment table/trigger.
+    def downgrade(conn):
+        conn.execute("DROP TRIGGER passive_attachments_message_delete")
+        conn.execute("DROP TABLE passive_history_attachments")
+        conn.execute("UPDATE schema_version SET version=31")
+    old._execute_write(downgrade)
+    old.close()
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 31
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='passive_history_attachments'").fetchone() is None
+    upgraded = SessionDB(path)
+    try:
+        with upgraded._read_ctx() as conn:
+            assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='passive_history_attachments'").fetchone()
+            assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='passive_attachments_message_delete'").fetchone()
+        service = PassiveHistoryIngress()
+        attached = attach(service, upgraded)
+        assert call(service, upgraded, "commit", event(attached))["status"] == "saved"
+    finally:
+        upgraded.close()
+
+
+def test_empty_session_delete_recreate_invalidates_attachment_via_fk(store):
+    db, deleting_db, service = store
+    attached = attach(service, db)
+    assert db.get_messages("original") == []
+    for handle in (db, deleting_db):
+        assert handle._execute_write(lambda conn: conn.execute("PRAGMA foreign_keys").fetchone()[0]) == 1
+    deleting_db.delete_session("original")
+    deleting_db.create_session("original", source="test")
+    with pytest.raises(IngressError, match="stale_attachment"):
+        call(service, db, "commit", event(attached))
+    assert db.get_messages("original") == []
+
+
+def test_multibyte_snapshot_truncation_never_adds_empty_rows(store):
+    db, _, service = store
+    for text in ("😀", "😀", "😀" * 8192, "a"):
+        db.append_message("original", "user", text)
+    snapshot = call(service, db, "attach", {"tab_id": "tab-a", "session_id": "original"})["snapshot"]
+    assert snapshot["truncated"] is True
+    assert all(message["content"] for message in snapshot["messages"])
+    assert sum(len(message["content"].encode()) for message in snapshot["messages"]) <= 32 * 1024
+
+
+def test_snapshot_uses_canonical_compaction_display_projection(store):
+    from agent.context_compressor import (
+        SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER, _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER,
+    )
+    db, _, service = store
+    summary = f"{SUMMARY_PREFIX}\ninternal model handoff\n{_SUMMARY_END_MARKER}"
+    merged = f"{_MERGED_PRIOR_CONTEXT_HEADER}\nreal earlier ask\n{_MERGED_SUMMARY_DELIMITER}\n{summary}"
+    db.append_messages_batch("original", [
+        {"role": "user", "content": summary, "_compressed_summary": True},
+        {"role": "user", "content": merged, "_compressed_summary": True, "display_kind": "hidden"},
+        {"role": "user", "content": "internal notice", "display_kind": "async_delegation_complete"},
+        {"role": "user", "content": "operator steering", "display_kind": "steer"},
+        {"role": "assistant", "content": "spoken answer", "display_kind": "passive_conversation"},
+    ])
+    snapshot = call(service, db, "attach", {"tab_id": "tab-a", "session_id": "original"})["snapshot"]
+    assert [message["content"] for message in snapshot["messages"]] == [
+        "real earlier ask", "operator steering", "spoken answer"]
