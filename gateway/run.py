@@ -21503,21 +21503,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _turnhold_msg = t(
                                                 "gateway.compress.turnhold_deferred"
                                             )
-                                            try:
-                                                _adapter = self._adapter_for_source(source)
-                                                if _adapter and source.chat_id:
-                                                    await _adapter.send(
-                                                        source.chat_id,
-                                                        _turnhold_msg,
-                                                        metadata=_hyg_meta,
+                                            if _turnhold_msg:
+                                                try:
+                                                    _adapter = self._adapter_for_source(source)
+                                                    if _adapter and source.chat_id:
+                                                        await _adapter.send(
+                                                            source.chat_id,
+                                                            _turnhold_msg,
+                                                            metadata=_hyg_meta,
+                                                        )
+                                                except Exception as _werr:
+                                                    logger.warning(
+                                                        "Failed to deliver compression-turnhold "
+                                                        "notice to user: %s",
+                                                        _werr,
                                                     )
-                                            except Exception as _werr:
-                                                logger.warning(
-                                                    "Failed to deliver compression-turnhold "
-                                                    "notice to user: %s",
-                                                    _werr,
-                                                )
-                                            raise
                                     except asyncio.TimeoutError:
                                         _hyg_waited = time.monotonic() - _hyg_wait_started
                                         _hyg_total_exhausted = (
