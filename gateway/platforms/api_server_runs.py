@@ -5,7 +5,9 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
+import unicodedata
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -34,9 +36,16 @@ _ROOM_RETENTION_REQUEST_KEY = (
 _SUBAGENT_EVENT_KEYS = (
     "goal", "task_count", "task_index", "subagent_id", "child_session_id", "delegation_id", "parent_id",
     "depth", "model", "tool_count", "status", "summary", "duration_seconds", "input_tokens",
-    "output_tokens", "reasoning_tokens", "api_calls", "cost_usd", "files_read", "files_written",
-    "output_tail")
+    "output_tokens", "reasoning_tokens", "api_calls", "cost_usd", "output_tail")
 _SUBAGENT_TEXT_KEYS = ("goal", "summary", "output_tail")
+_SUBAGENT_PATH_KEYS = ("files_read", "files_written")
+_PUBLIC_SUBTASK_MAX = 32
+_PUBLIC_SUBTASK_LABEL_MAX = 120
+_PRIVATE_LABEL_MAX_CHARS = 16_000
+_PRIVATE_PATH_LIST_MAX = 40
+_PRIVATE_PATH_MAX_CHARS = 4096
+_PUBLIC_SUBTASK_STATUSES = frozenset({"completed", "failed", "interrupted", "timeout", "error"})
+_PUBLIC_SUBTASK_ALL_STATUSES = _PUBLIC_SUBTASK_STATUSES | {"running"}
 # Terminal usage payload: (wire key, agent attribute), in wire order.
 _USAGE_FIELDS = (
     ("input_tokens", "session_prompt_tokens"), ("output_tokens", "session_completion_tokens"),
@@ -59,6 +68,155 @@ def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., st
     preview = redact_sensitive_text(text, force=True)
     limit = _TOOL_COMPLETED_PREVIEW_MAX_CHARS
     return preview if len(preview) <= limit else preview[: limit - 3] + "..."
+
+
+def _validated_private_path_count(value: Any) -> int | None:
+    """Return a count only after validating the complete private path list."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > _PRIVATE_PATH_LIST_MAX:
+        return None
+    if any(
+        not isinstance(item, str) or not item or len(item) > _PRIVATE_PATH_MAX_CHARS or "\x00" in item
+        for item in value
+    ):
+        return None
+    return len(value)
+
+
+def _validated_private_path_counts(fields: dict[str, Any]) -> dict[str, int] | None:
+    """Validate every supplied private list before releasing any derived count."""
+    result: dict[str, int] = {}
+    for private_key in _SUBAGENT_PATH_KEYS:
+        if private_key not in fields:
+            continue
+        count = _validated_private_path_count(fields[private_key])
+        if count is None:
+            return None
+        result[f"{private_key}_count"] = count
+    return result
+
+
+def _is_safe_public_subtask_label(value: Any) -> bool:
+    if not isinstance(value, str) or not value or len(value) > _PUBLIC_SUBTASK_LABEL_MAX:
+        return False
+    if value != " ".join(value.split()) or any(
+        unicodedata.category(char).startswith("C") for char in value
+    ):
+        return False
+    if "/" in value or "\\" in value:
+        return False
+    return not any(
+        value[index].isalpha() and value[index + 1] == ":" and not value[index + 2].isspace()
+        for index in range(len(value) - 2)
+    )
+
+
+def _public_subtask_label(value: Any, redact_sensitive_text: Callable[..., str]) -> str | None:
+    """Build one bounded display label without carrying secrets or filesystem paths."""
+    if not isinstance(value, str) or not value or len(value) > _PRIVATE_LABEL_MAX_CHARS:
+        return None
+    text = redact_sensitive_text(value, force=True).replace("\x00", " ")
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if not _is_safe_public_subtask_label(text[:_PUBLIC_SUBTASK_LABEL_MAX]):
+        text = "Subtask"
+    if len(text) > _PUBLIC_SUBTASK_LABEL_MAX:
+        text = text[: _PUBLIC_SUBTASK_LABEL_MAX - 3].rstrip() + "..."
+    return text if _is_safe_public_subtask_label(text) else None
+
+
+def _public_subtask_id(run_id: str, value: Any) -> str | None:
+    """Scope a stable internal child id to this run without exposing either source id."""
+    if not isinstance(value, str) or not value or len(value) > 512 or "\x00" in value:
+        return None
+    fingerprint = hashlib.sha256(f"{run_id}\x00{value}".encode()).hexdigest()[:24]
+    return f"subtask_{fingerprint}"
+
+
+def _validated_public_subtasks(value: Any) -> list[dict[str, Any]] | None:
+    """Copy a complete public projection only when every persisted entry is canonical."""
+    if not isinstance(value, list) or len(value) > _PUBLIC_SUBTASK_MAX:
+        return None
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    allowed = {"id", "label", "status", "files_read_count", "files_written_count"}
+    for source in value:
+        if not isinstance(source, dict) or not set(source) <= allowed:
+            return None
+        public_id, label, status = source.get("id"), source.get("label"), source.get("status")
+        if (
+            not isinstance(public_id, str)
+            or len(public_id) != 32
+            or not public_id.startswith("subtask_")
+            or any(char not in "0123456789abcdef" for char in public_id[8:])
+            or public_id in seen
+            or not _is_safe_public_subtask_label(label)
+            or not isinstance(status, str)
+            or status not in _PUBLIC_SUBTASK_ALL_STATUSES
+        ):
+            return None
+        item = {"id": public_id, "label": label, "status": status}
+        for key in ("files_read_count", "files_written_count"):
+            if key not in source:
+                continue
+            count = source[key]
+            if type(count) is not int or not 0 <= count <= _PRIVATE_PATH_LIST_MAX:
+                return None
+            item[key] = count
+        seen.add(public_id)
+        result.append(item)
+    return result
+
+
+def _merge_public_subtask(
+    current: Any,
+    *,
+    run_id: str,
+    event_type: str,
+    preview: Any,
+    fields: dict[str, Any],
+    redact_sensitive_text: Callable[..., str],
+) -> list[dict[str, Any]] | None:
+    """Merge one validated lifecycle event into the bounded public run projection."""
+    public_id = _public_subtask_id(run_id, fields.get("subagent_id"))
+    if public_id is None:
+        return None
+    terminal_status = fields.get("status")
+    if event_type == "subagent.complete" and (
+        not isinstance(terminal_status, str) or terminal_status not in _PUBLIC_SUBTASK_STATUSES
+    ):
+        return None
+    if current is None:
+        items: list[dict[str, Any]] = []
+    else:
+        items = _validated_public_subtasks(current)
+        if items is None:
+            return None
+    position = next((index for index, item in enumerate(items) if item.get("id") == public_id), None)
+    if position is None:
+        if len(items) >= _PUBLIC_SUBTASK_MAX:
+            return None
+        label = _public_subtask_label(fields.get("goal") or preview, redact_sensitive_text)
+        if label is None:
+            return None
+        item = {
+            "id": public_id,
+            "label": label,
+            "status": "running",
+        }
+        items.append(item)
+        position = len(items) - 1
+    item = items[position]
+    if event_type == "subagent.complete":
+        if item["status"] != "running":
+            return items
+        item["status"] = terminal_status
+        path_counts = _validated_private_path_counts(fields)
+        if path_counts is not None:
+            item.update(path_counts)
+    return items
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -129,6 +287,7 @@ def _initialize_run_state(self, *, store_factory, store_path=None) -> None:
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
     self._shutdown_interrupted_run_ids: set[str] = set()
+    self._public_subtasks_lock = threading.Lock()
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
@@ -174,7 +333,9 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     should_persist = (
         status != previous_status
         or status in TERMINAL_STATUSES
-        or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"}))
+        or bool(field_names & {
+            "output", "error", "usage", "pending_steer", "session_id", "public_subtasks"
+        }))
     if run_id in self._run_idempotency_ids and should_persist:
         try:
             self._run_idempotency_store.update_status(run_id, current)
@@ -199,9 +360,12 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
 
-    def _push(event: Dict[str, Any]) -> None:
+    def _push(event: Dict[str, Any], public_subtasks: list[dict[str, Any]] | None = None) -> None:
+        fields = {"last_event": event.get("event")}
+        if public_subtasks is not None:
+            fields["public_subtasks"] = public_subtasks
         self._set_run_status(
-            run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
+            run_id, self._run_statuses.get(run_id, {}).get("status", "running"), **fields)
         q = self._run_streams.get(run_id)
         if q is not None:
             with suppress(Exception):
@@ -227,7 +391,19 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
                     # Free text may carry child tool output: force secret redaction on this public stream.
                     redact = key in _SUBAGENT_TEXT_KEYS and isinstance(value, str)
                     event[key] = redact_sensitive_text(value, force=True) if redact else value
-            _push(event)
+            path_counts = _validated_private_path_counts(kwargs)
+            if path_counts is not None:
+                event.update(path_counts)
+            with self._public_subtasks_lock:
+                public_subtasks = _merge_public_subtask(
+                    self._run_statuses.get(run_id, {}).get("public_subtasks"),
+                    run_id=run_id,
+                    event_type=event_type,
+                    preview=preview,
+                    fields=kwargs,
+                    redact_sensitive_text=redact_sensitive_text,
+                )
+                _push(event, public_subtasks)
 
     return _callback
 
@@ -278,6 +454,12 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
     """Hydrate a scoped run status and fail stale owners closed."""
     status = self._run_statuses.get(run_id)
     if status is not None:
+        if "public_subtasks" in status:
+            public_subtasks = _validated_public_subtasks(status["public_subtasks"])
+            if public_subtasks:
+                status["public_subtasks"] = public_subtasks
+            else:
+                status.pop("public_subtasks", None)
         if run_id in self._run_idempotency_ids:
             scope = self._run_idempotency_scope(request)
             self._run_idempotency_store.extend_retention(scope, run_id, _room_retention_until(request))
@@ -288,6 +470,12 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
     if record is None:
         return None
     status = dict(record["status"])
+    if "public_subtasks" in status:
+        public_subtasks = _validated_public_subtasks(status["public_subtasks"])
+        if public_subtasks:
+            status["public_subtasks"] = public_subtasks
+        else:
+            status.pop("public_subtasks", None)
     if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
         int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
         status.update(

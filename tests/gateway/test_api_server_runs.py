@@ -416,6 +416,158 @@ class TestRunStatus:
 
 class TestRunEvents:
     @pytest.mark.asyncio
+    async def test_subtask_projection_is_bounded_path_private_and_durable(self, adapter, tmp_path):
+        run_id = "run_public_subtasks"
+        path = tmp_path / "subtasks.db"
+        _use_idempotency_db(adapter, path)
+        request = MagicMock(headers={})
+        scope = adapter._run_idempotency_scope(request)
+        initial = {"object": "hermes.run", "run_id": run_id, "status": "running"}
+        adapter._run_idempotency_store.reserve(
+            scope, "subtask-key", "fingerprint", run_id, initial,
+            owner_pid=adapter._run_owner_pid, owner_started=adapter._run_owner_started,
+        )
+        adapter._run_idempotency_ids.add(run_id)
+        adapter._run_statuses[run_id] = dict(initial)
+        adapter._run_streams[run_id] = asyncio.Queue()
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+        secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
+        callback(
+            "subagent.start", preview="Inspect private files", subagent_id="child-internal-1",
+            goal=f"Inspect C:\\Users\\John Smith\\private.txt and src/private.py with {secret}",
+        )
+        callback(
+            "subagent.complete", subagent_id="child-internal-1", status="completed",
+            files_read=["C:\\Users\\owner\\private.txt", "/home/owner/secret.txt"],
+            files_written=["C:\\Users\\owner\\result.txt"],
+        )
+
+        started = await adapter._run_streams[run_id].get()
+        completed = await adapter._run_streams[run_id].get()
+        assert started["event"] == "subagent.start"
+        assert completed["files_read_count"] == 2
+        assert completed["files_written_count"] == 1
+        assert "files_read" not in completed and "files_written" not in completed
+        serialized_event = str(completed)
+        assert "private.txt" not in serialized_event and "result.txt" not in serialized_event
+
+        public = adapter._run_statuses[run_id]["public_subtasks"]
+        assert len(public) == 1
+        expected_id = "subtask_" + hashlib.sha256(
+            f"{run_id}\0child-internal-1".encode()
+        ).hexdigest()[:24]
+        assert public[0]["id"] == expected_id
+        assert public[0]["id"] != "child-internal-1"
+        assert public[0]["id"] != "subtask_" + hashlib.sha256(
+            "another-run\0child-internal-1".encode()
+        ).hexdigest()[:24]
+        assert public[0]["status"] == "completed"
+        assert public[0]["files_read_count"] == 2
+        assert public[0]["files_written_count"] == 1
+        assert secret not in public[0]["label"]
+        assert "C:\\Users" not in public[0]["label"]
+        assert "private.txt" not in public[0]["label"]
+        assert "src/private.py" not in public[0]["label"]
+        assert public[0]["label"] == "Subtask"
+        adapter._run_idempotency_store.close()
+
+        restarted = _make_adapter()
+        _use_idempotency_db(restarted, path)
+        hydrated = restarted._durable_run_status(request, run_id)
+        assert hydrated["public_subtasks"] == public
+        restarted._run_idempotency_store.close()
+
+    @pytest.mark.asyncio
+    async def test_subtask_projection_rejects_malformed_paths_and_caps_in_event_order(self, adapter):
+        run_id = "run_public_subtask_bounds"
+        adapter._run_streams[run_id] = asyncio.Queue()
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+        for index in range(35):
+            callback(
+                "subagent.start", subagent_id=f"internal-{index}",
+                goal=f"Task {index}",
+            )
+        first_id = adapter._run_statuses[run_id]["public_subtasks"][0]["id"]
+        callback(
+            "subagent.complete", subagent_id="internal-0", status="completed",
+            files_read=["C:\\safe.txt", 7], files_written={"C:\\unsafe.txt": True},
+        )
+        callback("subagent.start", subagent_id="internal-0", goal="Late duplicate start")
+        callback(
+            "subagent.complete", subagent_id="internal-0", status="failed",
+            files_read=["C:\\must-not-replace.txt"], files_written=[],
+        )
+        callback("subagent.complete", subagent_id="internal-1", status=["failed"])
+
+        public = adapter._run_statuses[run_id]["public_subtasks"]
+        assert len(public) == 32
+        assert public[0] == {"id": first_id, "label": "Task 0", "status": "completed"}
+        assert [item["label"] for item in public[:3]] == ["Task 0", "Task 1", "Task 2"]
+        events = [await adapter._run_streams[run_id].get() for _ in range(39)]
+        completed = events[35]
+        assert "files_read" not in completed and "files_read_count" not in completed
+        assert "files_written" not in completed and "files_written_count" not in completed
+
+    @pytest.mark.asyncio
+    async def test_subtask_label_rejects_drive_relative_path_and_malformed_state_is_not_overwritten(
+        self, adapter
+    ):
+        loop = asyncio.get_running_loop()
+        path_run = "run_drive_relative"
+        path_callback = adapter._make_run_event_callback(path_run, loop)
+        path_callback("subagent.start", subagent_id="path-child", goal='Open "(C:secret.txt)"')
+        assert adapter._run_statuses[path_run]["public_subtasks"][0]["label"] == "Subtask"
+        for index, control in enumerate(("\u202e", "\u200b", "\u2066")):
+            control_run = f"run_control_{index}"
+            control_callback = adapter._make_run_event_callback(control_run, loop)
+            control_callback(
+                "subagent.start", subagent_id=f"control-child-{index}",
+                goal=f"Review {control}hidden text",
+            )
+            assert adapter._run_statuses[control_run]["public_subtasks"][0]["label"] == "Subtask"
+
+        run_id = "run_malformed_merge"
+        malformed = [{
+            "id": "subtask_" + "a" * 24,
+            "label": "C:secret.txt",
+            "status": "running",
+            "raw_path": "C:\\secret.txt",
+        }]
+        adapter._run_statuses[run_id] = {
+            "run_id": run_id, "status": "running", "public_subtasks": malformed,
+        }
+        callback = adapter._make_run_event_callback(run_id, loop)
+        callback(
+            "subagent.start", subagent_id="new-child", goal="C:secret.txt",
+        )
+        assert adapter._run_statuses[run_id]["public_subtasks"] == malformed
+
+    @pytest.mark.parametrize("label", [
+        "C:\\Users\\owner\\secret.txt", 'Open "(C:secret.txt)"', "line one\nline two",
+        "hidden\x00suffix", "two  spaces", "hidden\u202eoverride", "hidden\u200bspace",
+        "hidden\u2066isolate",
+    ])
+    def test_hydration_drops_malformed_public_subtasks(self, adapter, tmp_path, label):
+        path = tmp_path / "malformed-subtasks.db"
+        _use_idempotency_db(adapter, path)
+        request = MagicMock(headers={})
+        scope = adapter._run_idempotency_scope(request)
+        run_id = "run_malformed_public_subtasks"
+        adapter._run_idempotency_store.reserve(
+            scope, "malformed-key", "fingerprint", run_id,
+            {"run_id": run_id, "status": "completed", "public_subtasks": [{
+                "id": "subtask_" + "a" * 24,
+                "label": label,
+                "status": "completed",
+            }]},
+            owner_pid=adapter._run_owner_pid, owner_started=adapter._run_owner_started,
+        )
+        adapter._run_statuses.pop(run_id, None)
+
+        hydrated = adapter._durable_run_status(request, run_id)
+        assert "public_subtasks" not in hydrated
+
+    @pytest.mark.asyncio
     async def test_tool_completed_event_includes_redacted_bounded_result_preview(self, adapter):
         loop = asyncio.get_running_loop()
         adapter._run_streams["run_tool"] = asyncio.Queue()

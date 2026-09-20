@@ -136,6 +136,7 @@ def test_run_state_initialization_and_teardown_are_shard_owned():
     assert adapter._active_run_agents == {}
     assert adapter._active_run_tasks == {}
     assert adapter._stopping_run_ids == set()
+    assert adapter._public_subtasks_lock is not None
     assert adapter._run_statuses == {}
     assert adapter._run_approval_sessions == {}
 
