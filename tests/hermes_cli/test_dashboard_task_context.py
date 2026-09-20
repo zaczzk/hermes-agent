@@ -129,6 +129,11 @@ def test_service_token_requires_explicit_profile_grant(tmp_path, monkeypatch):
     with pytest.raises(PermissionError):
         resolve_dashboard_task_context(request, "beta")
 
+    for scopes in (("profile:*",), ("profile:beta",)):
+        request.state.token_principal = TokenPrincipal("service", "fixture", scopes)
+        with pytest.raises(PermissionError):
+            resolve_dashboard_task_context(request, "alpha")
+
 
 def test_unknown_profile_is_refused_without_creating_it(tmp_path, monkeypatch):
     homes, _expected = _profiles(tmp_path, monkeypatch)

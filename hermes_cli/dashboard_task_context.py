@@ -60,11 +60,10 @@ def resolve_dashboard_task_context(request, profile=None) -> DashboardTaskContex
     profile_name, profile_home = _cron_profile_home(profile)
     if principal_kind == "verified_service":
         token = request.state.token_principal
-        allowed_profiles = {f"profile:{profile_name}", "profile:*"}
         if (
             not isinstance(token.scopes, tuple)
             or any(not isinstance(scope, str) for scope in token.scopes)
-            or not allowed_profiles.intersection(token.scopes)
+            or f"profile:{profile_name}" not in token.scopes
         ):
             raise PermissionError("dashboard token does not grant this profile")
     db = _open_session_db_for_profile(profile_name, read_only=False)
