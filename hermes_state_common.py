@@ -476,6 +476,29 @@ CREATE TABLE IF NOT EXISTS passive_history_commits (
     UNIQUE(producer, event_id)
 );
 
+-- Content-free receipts for one authenticated linked-child admission.  Parent input and this
+-- receipt commit in the same state.db transaction; the separate runs idempotency store then
+-- reserves the recorded run id before any agent starts.  Raw credentials, idempotency keys,
+-- goals, context, and input text are never stored here.
+CREATE TABLE IF NOT EXISTS linked_child_admissions (
+    authority_scope TEXT NOT NULL,
+    idempotency_key_hash TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,
+    child_session_id TEXT NOT NULL UNIQUE,
+    selected_parent_session_id TEXT NOT NULL,
+    canonical_parent_session_id TEXT NOT NULL,
+    producer TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    origin_turn_id TEXT NOT NULL,
+    passive_revision INTEGER NOT NULL,
+    parent_message_id INTEGER NOT NULL,
+    correlation_id TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (authority_scope, idempotency_key_hash),
+    UNIQUE (authority_scope, correlation_id)
+);
+
 CREATE TABLE IF NOT EXISTS session_model_usage (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     model TEXT NOT NULL,

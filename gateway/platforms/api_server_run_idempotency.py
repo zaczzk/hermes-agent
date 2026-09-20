@@ -32,7 +32,10 @@ _MIGRATIONS = {
     "owner_pid": "INTEGER NOT NULL DEFAULT 0",
     "owner_started": "INTEGER NOT NULL DEFAULT 0",
     "retention_until": "REAL NOT NULL DEFAULT 0",
-    "acknowledged_at": "REAL"}
+    "acknowledged_at": "REAL",
+    # Linked approved actions are durable single-execution facts.  Once reserved they must
+    # survive ordinary terminal/ack retention, rather than becoming executable again.
+    "durable_replay": "INTEGER NOT NULL DEFAULT 0"}
 
 
 def _encode_status(status: Dict[str, Any]) -> str:
@@ -95,6 +98,7 @@ class RunIdempotencyStore:
                 owner_started INTEGER NOT NULL DEFAULT 0,
                 retention_until REAL NOT NULL DEFAULT 0,
                 acknowledged_at REAL,
+                durable_replay INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (scope, idempotency_key)
@@ -131,7 +135,8 @@ class RunIdempotencyStore:
                 raise
 
     def reserve(self, scope: str, key: str, fingerprint: str, run_id: str, status: Dict[str, Any], *,
-                owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0):
+                owner_pid: int = 0, owner_started: int = 0, retention_until: float = 0,
+                durable_replay: bool = False):
         """Atomically reserve a key; return ``(outcome, stored_record)``."""
         now = time.time()
         retention_until = max(0.0, float(retention_until or 0))
@@ -142,15 +147,20 @@ class RunIdempotencyStore:
             if row is not None:
                 if retention_until:
                     self._conn.execute(_EXTEND_RETENTION_BY_KEY, (retention_until, scope, key, fingerprint))
+                if durable_replay and hmac.compare_digest(row[0], fingerprint):
+                    self._conn.execute(
+                        "UPDATE run_idempotency SET durable_replay=1 "
+                        "WHERE scope=? AND idempotency_key=?",
+                        (scope, key))
                 self._conn.commit()
                 return _outcome(row, fingerprint)
             self._conn.execute(
                 "INSERT INTO run_idempotency("
                 "scope,idempotency_key,fingerprint,run_id,status_json,"
-                "owner_pid,owner_started,retention_until,created_at,updated_at"
-                ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "owner_pid,owner_started,retention_until,durable_replay,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (scope, key, fingerprint, run_id, encoded, int(owner_pid or 0), int(owner_started or 0),
-                 retention_until, now, now))
+                 retention_until, int(bool(durable_replay)), now, now))
             self._conn.commit()
             return "created", _record(run_id, encoded, owner_pid, owner_started, now) | {"status": status}
 
@@ -171,10 +181,11 @@ class RunIdempotencyStore:
         lock + transaction): a long or disconnected room turn may outlive the retention window."""
         stale = self._conn.execute(
             """SELECT scope, idempotency_key, status_json
-                 FROM run_idempotency
-                WHERE acknowledged_at <= ?
-                   OR (retention_until > 0 AND retention_until <= ?)
-                   OR (retention_until <= 0 AND updated_at < ?)""",
+                FROM run_idempotency
+                WHERE durable_replay=0 AND (
+                       acknowledged_at <= ?
+                    OR (retention_until > 0 AND retention_until <= ?)
+                    OR (retention_until <= 0 AND updated_at < ?))""",
             (now - self.ACKNOWLEDGED_RETENTION_SECONDS, now, now - self.RETENTION_SECONDS),
         ).fetchall()
         for stale_scope, stale_key, stale_status in stale:

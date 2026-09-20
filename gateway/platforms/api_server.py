@@ -2150,6 +2150,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     def _create_agent(
         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
         tool_complete_callback=None, gateway_session_key: Optional[str] = None,
         requested_model: Optional[str] = None, requested_provider: Optional[str] = None,
@@ -2199,6 +2200,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets, "session_id": session_id,
+            "parent_session_id": parent_session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
@@ -2301,6 +2303,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._session_db_unavailable()
         try:
             passive_capabilities = await asyncio.to_thread(capabilities_for_db, db)
+            from gateway.platforms.api_server_linked_child import capabilities as linked_child_capabilities
+            linked_child = await asyncio.to_thread(linked_child_capabilities, self, db)
         except (RuntimeError, sqlite3.Error):
             return self._session_db_unavailable()
         return web.json_response({
@@ -2318,6 +2322,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
+                **({"linked_child_dispatch": linked_child} if linked_child is not None else {}),
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),
                 # Always advertised for feature-detection; enabled follows config.

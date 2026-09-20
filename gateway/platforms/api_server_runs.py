@@ -517,8 +517,23 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
+    from gateway.platforms import api_server_linked_child
+
+    linked = None
     idempotency_scope = idempotency_fingerprint = ""
-    if idempotency_key:
+    if api_server_linked_child.has_linked_child_fields(body):
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = _api_server._api_request_profile.get() or get_active_profile_name()
+        linked, linked_error = await api_server_linked_child.prepare(
+            self, request, body, idempotency_key=idempotency_key,
+            profile=profile, gateway_session_key=gateway_session_key or "",
+            _openai_error=_openai_error)
+        if linked_error is not None:
+            return linked_error
+        idempotency_scope = linked.idempotency_scope
+        idempotency_fingerprint = linked.admission.request_sha256
+    elif idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
         idempotency_fingerprint = hashlib.sha256(json.dumps(
             {"body": body, "gateway_session_key": gateway_session_key or ""},
@@ -527,7 +542,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     raw_input = body.get("input")
     if not raw_input:
         return _json_error(_openai_error, "Missing 'input' field", status=400)
-    if isinstance(raw_input, str):
+    if linked is not None:
+        user_message = linked.goal
+    elif isinstance(raw_input, str):
         user_message = raw_input
     else:
         user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
@@ -537,8 +554,12 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
         return _json_error(_openai_error, str(exc), code="invalid_author", status=400)
-    conversation_history, instructions, stored_session_id, history_err = (
-        _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
+    if linked is not None:
+        conversation_history, instructions, stored_session_id, history_err = (
+            [], linked.labelled_context, None, None)
+    else:
+        conversation_history, instructions, stored_session_id, history_err = (
+            _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
     if history_err is not None:
         return history_err
     previous_response_id = body.get("previous_response_id")
@@ -563,15 +584,16 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     limited = self._concurrency_limited_response()
     if limited is not None:
         return limited
-    run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    run_id = linked.admission.run_id if linked is not None else f"run_{uuid.uuid4().hex}"
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
-    _declared_selected = not session_id and bool(gateway_session_key)
-    selected_session_id = session_id or (
-        await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
-        if _declared_selected else None)
+    _declared_selected = linked is None and not session_id and bool(gateway_session_key)
+    selected_session_id = (
+        linked.admission.child_session_id if linked is not None else session_id or (
+            await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
+            if _declared_selected else None)
+    )
     # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
     # history loads from it, the turn writes to it, and a detached delivery row persisted to it
     # is what the next same-id run consumes below.
@@ -587,30 +609,49 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
     # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
     session_history_delivery = not previous_response_id and not conversation_history
-    if not conversation_history and selected_session_id and not previous_response_id:
+    if linked is None and not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    q = self._run_streams[run_id] = asyncio.Queue()
-    created_at = self._run_streams_created[run_id] = time.time()
-    self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
-    initial_status = self._set_run_status(
-        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
+    created_at = time.time()
+    status_session_id = (
+        linked.admission.selected_parent_session_id if linked is not None else session_id)
+    linked_status = ({
+        "child_session_id": linked.admission.child_session_id,
+        "parent_message_id": linked.admission.parent_message_id,
+        "origin_turn_id": linked.admission.origin_turn_id,
+        "correlation_id": linked.admission.correlation_id,
+        "goal": linked.goal,
+    } if linked is not None else {})
+    initial_status = {
+        "object": "hermes.run", "run_id": run_id, "status": "queued",
+        "created_at": created_at, "updated_at": created_at,
+        "session_id": status_session_id, "model": body.get("model", self._model_name),
+        **linked_status,
+    }
     if idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
-            retention_until=_room_retention_until(request))
+            retention_until=_room_retention_until(request),
+            durable_replay=linked is not None)
         if outcome != "created":
-            _forget_run(
-                self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    # The durable reservation wins before this stable run id can touch process-local maps.  A
+    # concurrent exact retry therefore observes/replays the first request without deleting or
+    # replacing its queue, status, approval session, ownership stamp, or executor task.
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    q = self._run_streams[run_id] = asyncio.Queue()
+    self._run_streams_created[run_id] = created_at
+    self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
+    self._run_statuses[run_id] = initial_status
     launch = _RunLaunch(
         self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
         conversation_history, session_history_delivery,
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+            parent_session_id=(
+                linked.admission.canonical_parent_session_id if linked is not None else None),
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),

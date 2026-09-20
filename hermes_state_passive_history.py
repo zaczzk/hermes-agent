@@ -295,6 +295,57 @@ class SessionPassiveHistoryMixin:
             producer, event_id, origin_turn_id, payload_sha256, conversation_id, session_id,
             json.dumps(list(message_ids)), time.time())).lastrowid
 
+    def _append_passive_messages_on_conn(
+        self, conn, session_id: str, *, producer: str, event_id: str,
+        origin_turn_id: str, rows: List[Dict[str, str]], fingerprint: str,
+        commit_guard=None,
+    ) -> PassiveHistoryReceipt:
+        """Commit or replay validated passive rows on the caller's writer transaction."""
+        if commit_guard is not None:
+            commit_guard(conn)
+        receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
+        if receipt is not None:
+            self._verify_passive_receipt(conn, receipt, producer=producer, event_id=event_id)
+            if fingerprint != str(receipt["payload_sha256"]):
+                raise PassiveHistoryConflictError(
+                    f"Passive history event {event_id!r} is already committed with a different "
+                    "payload or origin turn")
+            if self._passive_conversation_id(conn, session_id) != str(receipt["conversation_id"]):
+                raise PassiveHistoryConflictError(
+                    f"Passive history event {event_id!r} belongs to another conversation; "
+                    "an explicit branch needs its own event identity")
+            return PassiveHistoryReceipt(
+                producer=producer, event_id=event_id, origin_turn_id=str(receipt["origin_turn_id"]),
+                conversation_id=str(receipt["conversation_id"]), session_id=str(receipt["session_id"]),
+                message_ids=_committed_message_ids(receipt["message_ids_json"]),
+                revision=int(receipt["id"]), replayed=True)
+
+        conversation_id = self._passive_conversation_id(conn, session_id)
+        tip = self._resolve_passive_history_tip(
+            conn, conversation_id, requested_session_id=session_id)
+        try:
+            self._check_transcript_write_guards(conn, tip, None, reject_active_turn_lease=True)
+        except SessionTurnLeaseLostError as exc:
+            raise PassiveHistoryBusyError(
+                f"Conversation {conversation_id!r} has an active turn; "
+                "retry this passive commit once it finishes") from exc
+        pending = [{"role": row["role"], "content": row["content"],
+                    "display_kind": PASSIVE_HISTORY_DISPLAY_KIND,
+                    "display_metadata": {"producer": producer, "event_id": event_id,
+                                         "origin_turn_id": origin_turn_id, "index": index}}
+                   for index, row in enumerate(rows)]
+        inserted, tool_calls = self._insert_message_rows(conn, tip, pending)
+        self._bump_session_counters(conn, tip, inserted, tool_calls, unit=False)
+        message_ids = tuple(int(row["_row_id"]) for row in pending)
+        revision = self._insert_passive_receipt(
+            conn, producer=producer, event_id=event_id, origin_turn_id=origin_turn_id,
+            payload_sha256=fingerprint, conversation_id=conversation_id, session_id=tip,
+            message_ids=message_ids)
+        return PassiveHistoryReceipt(
+            producer=producer, event_id=event_id, origin_turn_id=origin_turn_id,
+            conversation_id=conversation_id, session_id=tip, message_ids=message_ids,
+            revision=int(revision), replayed=False)
+
     def append_passive_messages(self, session_id: str, *, producer: str, event_id: str,
         origin_turn_id: str, messages: List[Dict[str, str]], _commit_guard=None,
     ) -> PassiveHistoryReceipt:
@@ -325,51 +376,10 @@ class SessionPassiveHistoryMixin:
         def _do(conn) -> PassiveHistoryReceipt:
             # The authenticated transport's attachment generation must be fenced inside this
             # same writer transaction, serialized against tab replacement and detach.
-            if _commit_guard is not None:
-                _commit_guard(conn)
-            receipt = conn.execute(_RECEIPT_ROW_SQL, (producer, event_id)).fetchone()
-            if receipt is not None:
-                self._verify_passive_receipt(conn, receipt, producer=producer, event_id=event_id)
-                if fingerprint != str(receipt["payload_sha256"]):
-                    raise PassiveHistoryConflictError(
-                        f"Passive history event {event_id!r} is already committed with a different "
-                        "payload or origin turn")
-                # Ownership only: a replay must stay recoverable after the conversation is closed.
-                if self._passive_conversation_id(conn, session_id) != str(receipt["conversation_id"]):
-                    raise PassiveHistoryConflictError(
-                        f"Passive history event {event_id!r} belongs to another conversation; "
-                        "an explicit branch needs its own event identity")
-                return PassiveHistoryReceipt(
-                    producer=producer, event_id=event_id, origin_turn_id=str(receipt["origin_turn_id"]),
-                    conversation_id=str(receipt["conversation_id"]), session_id=str(receipt["session_id"]),
-                    message_ids=_committed_message_ids(receipt["message_ids_json"]),
-                    revision=int(receipt["id"]), replayed=True)
-
-            conversation_id = self._passive_conversation_id(conn, session_id)
-            tip = self._resolve_passive_history_tip(
-                conn, conversation_id, requested_session_id=session_id)
-            try:
-                self._check_transcript_write_guards(conn, tip, None, reject_active_turn_lease=True)
-            except SessionTurnLeaseLostError as exc:
-                raise PassiveHistoryBusyError(
-                    f"Conversation {conversation_id!r} has an active turn; "
-                    "retry this passive commit once it finishes") from exc
-            pending = [{"role": row["role"], "content": row["content"],
-                        "display_kind": PASSIVE_HISTORY_DISPLAY_KIND,
-                        "display_metadata": {"producer": producer, "event_id": event_id,
-                                             "origin_turn_id": origin_turn_id, "index": index}}
-                       for index, row in enumerate(rows)]
-            inserted, tool_calls = self._insert_message_rows(conn, tip, pending)
-            self._bump_session_counters(conn, tip, inserted, tool_calls, unit=False)
-            message_ids = tuple(int(row["_row_id"]) for row in pending)
-            revision = self._insert_passive_receipt(
-                conn, producer=producer, event_id=event_id, origin_turn_id=origin_turn_id,
-                payload_sha256=fingerprint, conversation_id=conversation_id, session_id=tip,
-                message_ids=message_ids)
-            return PassiveHistoryReceipt(
-                producer=producer, event_id=event_id, origin_turn_id=origin_turn_id,
-                conversation_id=conversation_id, session_id=tip, message_ids=message_ids,
-                revision=int(revision), replayed=False)
+            return self._append_passive_messages_on_conn(
+                conn, session_id, producer=producer, event_id=event_id,
+                origin_turn_id=origin_turn_id, rows=rows, fingerprint=fingerprint,
+                commit_guard=_commit_guard)
 
         # Same patience as every other transcript writer: a sibling holding the lock for seconds
         # (VACUUM, checkpoint) must not turn into a lost user turn.
