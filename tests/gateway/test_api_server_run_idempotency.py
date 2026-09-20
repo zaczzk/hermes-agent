@@ -24,6 +24,25 @@ async def test_api_server_constructor_uses_module_run_store_binding(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_api_server_accepts_explicit_isolated_run_store_path(tmp_path, monkeypatch):
+    store = MagicMock()
+    store_factory = MagicMock(return_value=store)
+    monkeypatch.setattr(api_server, "RunIdempotencyStore", store_factory)
+    path = tmp_path / "isolated" / "runs.db"
+
+    adapter = api_server.APIServerAdapter(PlatformConfig(
+        enabled=True,
+        extra={"runs_idempotency_path": str(path)},
+    ))
+    try:
+        store_factory.assert_called_once_with(str(path))
+        assert adapter._run_idempotency_store is store
+    finally:
+        await adapter.disconnect()
+    store.close.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_disconnect_tolerates_bare_fixture_without_run_idempotency_store():
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
     adapter.platform = Platform.API_SERVER

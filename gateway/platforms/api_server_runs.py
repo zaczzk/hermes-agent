@@ -112,9 +112,9 @@ def _uses_room_run_auth(self, request: "web.Request") -> bool:
     return request.path.endswith("/v1/runs") and bool(self._room_grant_token(request))
 
 
-def _initialize_run_state(self, *, store_factory) -> None:
+def _initialize_run_state(self, *, store_factory, store_path=None) -> None:
     """Initialize adapter-owned durable and live ``/v1/runs`` state."""
-    self._run_idempotency_store = store_factory()
+    self._run_idempotency_store = store_factory() if store_path is None else store_factory(store_path)
     self._run_owner_pid = os.getpid()
     try:
         from gateway.status import get_process_start_time

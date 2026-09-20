@@ -1180,7 +1180,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._response_store = ResponseStore()
         from gateway.platforms import api_server_passive_history
         api_server_passive_history.initialize(self)
-        _api_runs._initialize_run_state(self, store_factory=RunIdempotencyStore)
+        _api_runs._initialize_run_state(
+            self,
+            store_factory=RunIdempotencyStore,
+            store_path=extra.get("runs_idempotency_path"),
+        )
         self._session_db: Optional[Any] = None  # explicit override (tests/manual wiring)
         self._session_dbs: Dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
