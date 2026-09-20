@@ -263,7 +263,7 @@ def test_strict_tip_refusal_keeps_the_exact_current_segment(
 @pytest.mark.parametrize("delayed_flush", [False, True])
 def test_typed_prompt_after_passive_history_is_durable(conversation, monkeypatch, role, delayed_flush):
     """Run the real loop and SQLite flush; only the provider and tool catalog are mocked."""
-    from tests.run_agent.test_run_agent import _mock_response
+    from tests.agent.test_run_agent import _mock_response
 
     host, ingress = conversation
     seed = _seed(host)

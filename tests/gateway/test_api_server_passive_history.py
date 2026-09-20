@@ -9,6 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_state import SessionDB
+from hermes_state_store_identity import get_store_id
 from passive_history_ingress import MAX_REQUEST_BYTES
 
 
@@ -49,7 +50,11 @@ async def test_authenticated_profile_ingress_and_canonical_readback(tmp_path, mo
                         {"Authorization": "bearer " + keys["alpha"]}):
             assert (await client.get(base + "/capabilities", headers=headers)).status == 401
         response = await client.get("/p/alpha/v1/capabilities", headers=auth)
-        assert (await response.json())["features"]["passive_history"]["origin_adoption"] is False
+        advertised = (await response.json())["features"]["passive_history"]
+        assert advertised["origin_adoption"] is False
+        assert advertised["store_id"] == get_store_id(stores["alpha"])
+        response = await client.get(base + "/capabilities", headers=auth)
+        assert (await response.json())["store_id"] == get_store_id(stores["alpha"])
         response = await client.post(base + "/attach", headers=auth,
                                      json={"tab_id": "tab", "session_id": "same-id"})
         assert response.status == 200

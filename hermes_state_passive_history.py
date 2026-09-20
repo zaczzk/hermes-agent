@@ -193,7 +193,7 @@ class SessionPassiveHistoryMixin:
             f"WHERE parent_session_id = ?{self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias='')}"
             "AND (ended_at IS NULL OR end_reason = 'compression') "
             "ORDER BY started_at ASC, id ASC",
-            (parent_session_id, parent_session_id, parent_session_id)).fetchall()
+            (parent_session_id,) * 4).fetchall()
         return [child for child in (dict(row) for row in rows)
                 if self._is_passive_continuation_child(child)]
 

@@ -2295,7 +2295,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
-        from passive_history_ingress import capabilities as passive_capabilities
+        from gateway.platforms.api_server_passive_history import capabilities_for_db
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return self._session_db_unavailable()
+        try:
+            passive_capabilities = await asyncio.to_thread(capabilities_for_db, db)
+        except (RuntimeError, sqlite3.Error):
+            return self._session_db_unavailable()
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2307,7 +2314,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "tools execute on the API-server host unless a future "
                     "explicit split-runtime mode is enabled.")},
             "features": {
-                "passive_history": passive_capabilities(),
+                "passive_history": passive_capabilities,
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
