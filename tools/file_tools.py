@@ -770,7 +770,16 @@ def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> li
     return warnings
 
 
-def _note_edited(task_id: str, paths: list[str], path_to_resolved: dict, session_id: str | None) -> None:
+def _note_edited(
+    task_id: str,
+    paths: list[str],
+    path_to_resolved: dict,
+    session_id: str | None,
+    *,
+    file_ops=None,
+    run_evidence_session=None,
+    tool_call_id: str | None = None,
+) -> None:
     """Post-success bookkeeping: verification-stale marker, then per path refresh
     the read stamp (no false staleness on the next edit) and record the write."""
     _mark_verification_stale(task_id, [path_to_resolved.get(p) or p for p in paths], session_id=session_id)
@@ -778,6 +787,10 @@ def _note_edited(task_id: str, paths: list[str], path_to_resolved: dict, session
         _update_read_timestamp(p, task_id)
         if path_to_resolved.get(p):
             file_state.note_write(task_id, path_to_resolved[p])
+            if run_evidence_session is not None and file_ops is not None:
+                run_evidence_session.note_write(
+                    path_to_resolved[p], tool_call_id=tool_call_id, file_ops=file_ops
+                )
 
 
 # Whole-file rewrite hint: an overwrite of an existing file this large whose new content keeps at least
@@ -828,7 +841,8 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
-                    session_id: str | None = None) -> str:
+                    session_id: str | None = None, *, run_evidence_session=None,
+                    tool_call_id: str | None = None) -> str:
     """Write content to a file.
 
     ``cross_profile`` bypasses the sandbox-mirror lost-write guards only
@@ -865,7 +879,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 return json.dumps(_stale_write_refusal(path, blocker, _resolved), ensure_ascii=False)
             warnings = _edit_warnings([path], path_to_resolved, task_id)
             rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
-            result_dict = _get_file_ops(task_id).write_file(_resolved or path, content).to_dict()
+            file_ops = _get_file_ops(task_id)
+            result_dict = file_ops.write_file(_resolved or path, content).to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
             if rewrite_hint and not result_dict.get("error"):
@@ -882,7 +897,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     # Own write = current whole-file content: consecutive
                     # same-task writes stay unblocked. patch never does this.
                     _mark_full_write_baseline(_resolved, task_id)
-                _note_edited(task_id, [path], path_to_resolved, session_id)
+                _note_edited(
+                    task_id, [path], path_to_resolved, session_id,
+                    file_ops=file_ops, run_evidence_session=run_evidence_session,
+                    tool_call_id=tool_call_id,
+                )
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -923,7 +942,8 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str]] | str:
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
-               session_id: str | None = None) -> str:
+               session_id: str | None = None, *, run_evidence_session=None,
+               tool_call_id: str | None = None) -> str:
     """Patch a file using replace mode or V4A patch format.
 
     ``cross_profile``: same semantics as ``write_file``'s flag (mirror-guard
@@ -977,7 +997,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 result_dict["files_modified"] = _resolved_modified
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
-                _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
+                _note_edited(
+                    task_id, _paths_to_check, _path_to_resolved, session_id,
+                    file_ops=file_ops, run_evidence_session=run_evidence_session,
+                    tool_call_id=tool_call_id,
+                )
                 # Clear failure counters so a future miss starts a fresh count.
                 _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
         # old_string-not-found hint. Failure escalation is tracked for replace
@@ -1291,6 +1315,8 @@ def _handle_write_file(args, **kw):
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        run_evidence_session=kw.get("run_evidence_session"),
+        tool_call_id=kw.get("tool_call_id"),
     )
 
 
@@ -1302,6 +1328,8 @@ def _handle_patch(args, **kw):
         replace_all=args.get("replace_all", False), patch=args.get("patch"), task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
         session_id=kw.get("session_id"),
+        run_evidence_session=kw.get("run_evidence_session"),
+        tool_call_id=kw.get("tool_call_id"),
     )
 
 

@@ -81,6 +81,9 @@ _CAPABILITY_ENDPOINTS = (
     ("responses", ("POST", "/v1/responses")), ("runs", ("POST", "/v1/runs")),
     ("run_status", ("GET", "/v1/runs/{run_id}")),
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
+    ("run_evidence", ("GET", "/v1/runs/{run_id}/evidence")),
+    ("run_evidence_item", ("GET", "/v1/runs/{run_id}/evidence/{package_id}/{item_id}")),
+    ("run_evidence_ack", ("POST", "/v1/runs/{run_id}/evidence/{package_id}/ack")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
     ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
@@ -118,6 +121,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_run_evidence as _run_evidence
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
@@ -1137,6 +1141,15 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _run_evidence_route_delegate(name: str):
+    async def _handler(self, request: "web.Request") -> "web.StreamResponse":
+        return await getattr(_run_evidence, name)(
+            self, request, _api_server=sys.modules[__name__]
+        )
+    _handler.__name__ = name
+    return _handler
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -1602,6 +1615,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        routes.extend(_run_evidence.http_routes(self))
         from gateway.platforms.api_server_passive_history import http_routes
         routes.extend(http_routes(self))
         if _CRON_AVAILABLE:
@@ -2326,6 +2340,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "chat_completions": True, "chat_completions_streaming": True,
                 "responses_api": True, "responses_streaming": True, "run_submission": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
+                **(
+                    {"result_evidence": evidence_capabilities}
+                    if (evidence_capabilities := _run_evidence.capabilities(self)) is not None
+                    else {}
+                ),
                 **({"linked_child_dispatch": linked_child} if linked_child is not None else {}),
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),
@@ -3934,6 +3953,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
+    _handle_run_evidence = _run_evidence_route_delegate("handle_manifest")
+    _handle_run_evidence_item = _run_evidence_route_delegate("handle_item")
+    _handle_run_evidence_ack = _run_evidence_route_delegate("handle_ack")
 
     async def _sweep_orphaned_runs(self) -> None:
         return await _api_runs._sweep_orphaned_runs(self)

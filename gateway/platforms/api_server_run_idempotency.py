@@ -1,8 +1,10 @@
 """Durable idempotency reservations for API server runs."""
 
+import hashlib
 import hmac
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 import time
@@ -17,6 +19,8 @@ from hermes_cli.sqlite_util import add_column_if_missing
 logger = logging.getLogger("gateway.platforms.api_server")
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+EVIDENCE_ACK_RETENTION_SECONDS = 30 * 24 * 60 * 60
+EVIDENCE_MAX_RETENTION_SECONDS = 90 * 24 * 60 * 60
 
 _SELECT_BY_KEY = (
     "SELECT fingerprint, run_id, status_json, owner_pid, owner_started, updated_at "
@@ -110,6 +114,48 @@ class RunIdempotencyStore:
                 add_column_if_missing(self._conn, "run_idempotency", column, f"{column} {ddl}")
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_evidence_packages (
+                scope TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                package_id TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                item_count INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                omitted_count INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                sealed_at REAL NOT NULL,
+                acknowledged_at REAL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (scope, run_id)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_evidence_items (
+                scope TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                package_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                content BLOB NOT NULL,
+                text_utf8 INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                PRIMARY KEY (scope, run_id, item_id),
+                UNIQUE (scope, run_id, ordinal)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_evidence_tombstones (
+                scope TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                package_id TEXT NOT NULL,
+                expired_at REAL NOT NULL,
+                PRIMARY KEY (scope, run_id)
+            )"""
+        )
         self._conn.commit()
         self._lock = threading.Lock()
         self._tighten_permissions()
@@ -234,6 +280,231 @@ class RunIdempotencyStore:
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",
                 (_encode_status(status), time.time(), run_id))
             self._conn.commit()
+
+    @staticmethod
+    def _evidence_descriptor(row) -> dict[str, Any]:
+        return {
+            "package_id": str(row[0]),
+            "state": str(row[1]),
+            "manifest_sha256": str(row[2]),
+            "item_count": int(row[3]),
+            "total_bytes": int(row[4]),
+            "omitted_count": int(row[5]),
+        }
+
+    def _prune_evidence_locked(self, now: float) -> None:
+        expired = self._conn.execute(
+            "SELECT scope,run_id,package_id FROM run_evidence_packages WHERE expires_at<=?",
+            (now,),
+        ).fetchall()
+        for scope, run_id, package_id in expired:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO run_evidence_tombstones(scope,run_id,package_id,expired_at) "
+                "VALUES(?,?,?,?)",
+                (scope, run_id, package_id, now),
+            )
+            self._conn.execute(
+                "DELETE FROM run_evidence_items WHERE scope=? AND run_id=?",
+                (scope, run_id),
+            )
+            self._conn.execute(
+                "DELETE FROM run_evidence_packages WHERE scope=? AND run_id=?",
+                (scope, run_id),
+            )
+
+    def seal_evidence(
+        self,
+        scope: str,
+        run_id: str,
+        *,
+        state: str,
+        items: list[dict[str, Any]],
+        omitted_count: int,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically persist one immutable owner/run evidence package."""
+        if state not in {"complete", "partial", "unavailable"}:
+            raise ValueError("invalid evidence state")
+        if type(omitted_count) is not int or omitted_count < 0 or len(items) > 8:
+            raise ValueError("invalid evidence counts")
+        now = time.time() if now is None else float(now)
+        with self._immediate_txn():
+            self._prune_evidence_locked(now)
+            existing = self._conn.execute(
+                "SELECT package_id,state,manifest_sha256,item_count,total_bytes,omitted_count "
+                "FROM run_evidence_packages WHERE scope=? AND run_id=?",
+                (scope, run_id),
+            ).fetchone()
+            if existing is not None:
+                self._conn.commit()
+                return self._evidence_descriptor(existing)
+            run = self._conn.execute(
+                "SELECT created_at FROM run_idempotency WHERE scope=? AND run_id=?",
+                (scope, run_id),
+            ).fetchone()
+            if run is None:
+                raise ValueError("run evidence owner is unavailable")
+            package_id = "evidence_" + secrets.token_hex(12)
+            public_items: list[dict[str, Any]] = []
+            total_bytes = 0
+            for ordinal, item in enumerate(items, 1):
+                item_id = item.get("item_id")
+                content = item.get("bytes")
+                size = item.get("size")
+                sha256 = item.get("sha256")
+                text_utf8 = item.get("text_utf8")
+                if (
+                    not isinstance(item_id, str)
+                    or not item_id.startswith("item_")
+                    or len(item_id) != 29
+                    or any(char not in "0123456789abcdef" for char in item_id[5:])
+                    or not isinstance(content, bytes)
+                    or type(size) is not int
+                    or size != len(content)
+                    or size > 1024 * 1024
+                    or not isinstance(sha256, str)
+                    or hashlib.sha256(content).hexdigest() != sha256
+                    or type(text_utf8) is not bool
+                ):
+                    raise ValueError("invalid evidence item")
+                total_bytes += size
+                if total_bytes > 4 * 1024 * 1024:
+                    raise ValueError("evidence package too large")
+                display_name = f"file-{ordinal:02d}.{'txt' if text_utf8 else 'bin'}"
+                public_items.append({
+                    "item_id": item_id,
+                    "ordinal": ordinal,
+                    "size": size,
+                    "sha256": sha256,
+                    "kind": "file",
+                    "display_name": display_name,
+                    "text_utf8": text_utf8,
+                })
+            manifest_source = {
+                "state": state,
+                "item_count": len(public_items),
+                "total_bytes": total_bytes,
+                "omitted_count": omitted_count,
+                "items": public_items,
+            }
+            manifest_sha256 = hashlib.sha256(json.dumps(
+                manifest_source, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            created_at = float(run[0])
+            expires_at = created_at + EVIDENCE_MAX_RETENTION_SECONDS
+            self._conn.execute(
+                "INSERT INTO run_evidence_packages VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    scope, run_id, package_id, state, manifest_sha256,
+                    len(public_items), total_bytes, omitted_count,
+                    created_at, now, None, expires_at,
+                ),
+            )
+            for item, public in zip(items, public_items):
+                self._conn.execute(
+                    "INSERT INTO run_evidence_items VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        scope, run_id, package_id, public["item_id"], public["ordinal"],
+                        public["size"], public["sha256"], item["bytes"],
+                        int(public["text_utf8"]), public["display_name"],
+                    ),
+                )
+            self._conn.commit()
+            return {
+                "package_id": package_id,
+                "state": state,
+                "manifest_sha256": manifest_sha256,
+                "item_count": len(public_items),
+                "total_bytes": total_bytes,
+                "omitted_count": omitted_count,
+            }
+
+    def evidence_tombstone(self, scope: str, run_id: str, package_id: str | None = None) -> bool:
+        with self._immediate_txn():
+            self._prune_evidence_locked(time.time())
+            query = "SELECT package_id FROM run_evidence_tombstones WHERE scope=? AND run_id=?"
+            row = self._conn.execute(query, (scope, run_id)).fetchone()
+            self._conn.commit()
+        return row is not None and (package_id is None or str(row[0]) == package_id)
+
+    def evidence_manifest(self, scope: str, run_id: str) -> dict[str, Any] | None:
+        with self._immediate_txn():
+            self._prune_evidence_locked(time.time())
+            package = self._conn.execute(
+                "SELECT package_id,state,manifest_sha256,item_count,total_bytes,omitted_count "
+                "FROM run_evidence_packages WHERE scope=? AND run_id=?",
+                (scope, run_id),
+            ).fetchone()
+            if package is None:
+                self._conn.commit()
+                return None
+            rows = self._conn.execute(
+                "SELECT item_id,ordinal,size,sha256,text_utf8,display_name "
+                "FROM run_evidence_items WHERE scope=? AND run_id=? ORDER BY ordinal",
+                (scope, run_id),
+            ).fetchall()
+            self._conn.commit()
+        return {
+            "object": "hermes.run.evidence",
+            "run_id": run_id,
+            **self._evidence_descriptor(package),
+            "items": [
+                {
+                    "item_id": str(row[0]), "ordinal": int(row[1]),
+                    "size": int(row[2]), "sha256": str(row[3]), "kind": "file",
+                    "display_name": str(row[5]), "text_utf8": bool(row[4]),
+                }
+                for row in rows
+            ],
+        }
+
+    def evidence_item(
+        self, scope: str, run_id: str, package_id: str, item_id: str
+    ) -> dict[str, Any] | None:
+        with self._immediate_txn():
+            self._prune_evidence_locked(time.time())
+            row = self._conn.execute(
+                "SELECT content,size,sha256,text_utf8,display_name FROM run_evidence_items "
+                "WHERE scope=? AND run_id=? AND package_id=? AND item_id=?",
+                (scope, run_id, package_id, item_id),
+            ).fetchone()
+            self._conn.commit()
+        if row is None:
+            return None
+        return {
+            "bytes": bytes(row[0]), "size": int(row[1]), "sha256": str(row[2]),
+            "text_utf8": bool(row[3]), "display_name": str(row[4]),
+        }
+
+    def acknowledge_evidence(
+        self, scope: str, run_id: str, package_id: str, manifest_sha256: str,
+        *, now: float | None = None,
+    ) -> dict[str, Any] | None:
+        now = time.time() if now is None else float(now)
+        with self._immediate_txn():
+            self._prune_evidence_locked(now)
+            row = self._conn.execute(
+                "SELECT manifest_sha256,created_at,acknowledged_at FROM run_evidence_packages "
+                "WHERE scope=? AND run_id=? AND package_id=?",
+                (scope, run_id, package_id),
+            ).fetchone()
+            if row is None:
+                self._conn.commit()
+                return None
+            if not hmac.compare_digest(str(row[0]), manifest_sha256):
+                raise ValueError("evidence manifest conflict")
+            acknowledged_at = float(row[2]) if row[2] is not None else now
+            expires_at = min(
+                acknowledged_at + EVIDENCE_ACK_RETENTION_SECONDS,
+                float(row[1]) + EVIDENCE_MAX_RETENTION_SECONDS,
+            )
+            self._conn.execute(
+                "UPDATE run_evidence_packages SET acknowledged_at=?,expires_at=? "
+                "WHERE scope=? AND run_id=? AND package_id=?",
+                (acknowledged_at, expires_at, scope, run_id, package_id),
+            )
+            self._conn.commit()
+        return {"acknowledged": True, "expires_at": expires_at}
 
     def close(self) -> None:
         with self._lock:

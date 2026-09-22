@@ -29,6 +29,30 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_run_evidence_context_reaches_exact_registry_dispatch(self):
+        evidence = type(
+            "Evidence",
+            (),
+            {"note_tool": lambda self, name, call_id: setattr(self, "seen", (name, call_id))},
+        )()
+        with patch("model_tools.registry.dispatch", return_value='{"ok":true}') as dispatch:
+            result = handle_function_call(
+                "write_file",
+                {"path": "result.txt", "content": "result"},
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id="session-1",
+                run_evidence_session=evidence,
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == '{"ok":true}'
+        assert evidence.seen == ("write_file", "call-1")
+        assert dispatch.call_args.kwargs["run_evidence_session"] is evidence
+        assert dispatch.call_args.kwargs["tool_call_id"] == "call-1"
+
 
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):

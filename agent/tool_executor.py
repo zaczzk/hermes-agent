@@ -1599,6 +1599,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                run_evidence_session=getattr(agent, "_run_evidence_session", None),
             )
 
     return _SequentialDispatch(

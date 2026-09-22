@@ -571,6 +571,8 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    evidence_session: Any = None
+    evidence_descriptor: Optional[Dict[str, Any]] = None
 
     @property
     def approval_session_key(self) -> str:
@@ -824,6 +826,19 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         if outcome != "created":
             return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
         self._run_idempotency_ids.add(run_id)
+    evidence_session = None
+    if linked is not None and getattr(self._run_idempotency_store, "durable", False):
+        from tools.run_evidence import RunEvidenceScope, RunEvidenceSession
+
+        evidence_session = RunEvidenceSession(RunEvidenceScope(
+            owner_scope=idempotency_scope,
+            api_run_id=run_id,
+            canonical_parent_session_id=linked.admission.canonical_parent_session_id,
+            child_session_id=linked.admission.child_session_id,
+            origin_turn_id=linked.admission.origin_turn_id,
+            correlation_id=linked.admission.correlation_id,
+            request_sha256=linked.admission.request_sha256,
+        ))
     # The durable reservation wins before this stable run id can touch process-local maps.  A
     # concurrent exact retry therefore observes/replays the first request without deleting or
     # replacing its queue, status, approval session, ownership stamp, or executor task.
@@ -844,7 +859,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author)
+        turn_author=turn_author,
+        evidence_session=evidence_session)
     self._activate_admitted_request()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
@@ -869,6 +885,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     from tools.approval_context import reset_current_session_key, set_current_session_key
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
+    if run.evidence_session is not None:
+        agent._run_evidence_session = run.evidence_session
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
     with self._profile_scope(run.request_profile):
@@ -919,6 +937,18 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
+                if run.evidence_session is not None:
+                    try:
+                        run.evidence_descriptor = run.evidence_session.seal(
+                            self._run_idempotency_store
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[api_server] failed to seal evidence for run %s", run.run_id
+                        )
+                    finally:
+                        with suppress(AttributeError):
+                            del agent._run_evidence_session
         return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
 
 
@@ -960,10 +990,19 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
         extra = extra or {}
+        if run.evidence_session is not None and run.evidence_descriptor is None:
+            try:
+                run.evidence_descriptor = run.evidence_session.seal(
+                    self._run_idempotency_store
+                )
+            except Exception:
+                logger.exception("[api_server] failed to seal evidence for run %s", run_id)
         if run_id in self._shutdown_interrupted_run_ids:
             status = "interrupted"
             fields = {"error": "Gateway shutdown interrupted the run."}
             extra = {}
+        if run.evidence_descriptor is not None:
+            extra = {**extra, "evidence": dict(run.evidence_descriptor)}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))

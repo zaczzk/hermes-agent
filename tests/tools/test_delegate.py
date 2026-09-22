@@ -2119,6 +2119,31 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 class TestFallbackModelInheritance(unittest.TestCase):
     """Subagents must inherit the parent's fallback provider chain."""
 
+    def test_child_inherits_exact_run_evidence_scope(self):
+        parent = _make_mock_parent(depth=0)
+        evidence = object()
+        parent._run_evidence_session = evidence
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={}),
+        ):
+            child = MagicMock()
+            MockAgent.return_value = child
+            result = _build_child_agent(
+                task_index=0,
+                goal="write delegated result",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertIs(result, child)
+        self.assertIs(child._run_evidence_session, evidence)
+
     def test_child_inherits_fallback_chain(self):
         """_build_child_agent passes parent._fallback_chain as fallback_model."""
         parent = _make_mock_parent(depth=0)
